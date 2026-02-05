@@ -24,6 +24,10 @@ pub mod pmtiles;
 /// Implementation of `Cloud Optimized GeoTIFF`' [`Source`].
 pub mod cog;
 
+#[cfg(feature = "zarr")]
+/// Implementation of `Zarr`' [`Source`].
+pub mod zarr;
+
 #[cfg(feature = "postgres")]
 /// Implementation of `PostgreSQL`' [`Source`].
 pub mod postgres;

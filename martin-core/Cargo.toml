@@ -20,6 +20,7 @@ default = [
     "sprites",
     "styles",
     "unstable-cog",
+    "zarr",
 ]
 postgres = [
     "dep:deadpool-postgres",
@@ -35,6 +36,7 @@ postgres = [
 ]
 unstable-cog = ["dep:png", "dep:tiff", "_tiles"]
 unstable-rendering = ["styles", "dep:maplibre_native", "dep:image"]
+zarr = ["dep:zarrs", "dep:proj", "_tiles"]
 fonts = [
     "dep:bit-set",
     "dep:pbf_font_tools",
@@ -62,7 +64,7 @@ maplibre_native = { workspace = true, optional = true }
 [dependencies]
 actix-web = { workspace = true, optional = true }
 async-trait.workspace = true
-base64  = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 bit-set = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }
@@ -76,6 +78,7 @@ pbf_font_tools = { workspace = true, optional = true }
 pmtiles = { workspace = true, optional = true }
 png = { workspace = true, optional = true }
 postgres = { workspace = true, optional = true }
+proj = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
@@ -93,6 +96,7 @@ tokio = { workspace = true, optional = true }
 tokio-postgres-rustls = { workspace = true, optional = true }
 tracing.workspace = true
 xxhash-rust.workspace = true
+zarrs = { workspace = true, optional = true }
 
 [dev-dependencies]
 actix-web.workspace = true
