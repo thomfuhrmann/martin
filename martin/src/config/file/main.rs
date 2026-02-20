@@ -23,6 +23,7 @@ use tracing::{error, info, warn};
     feature = "pmtiles",
     feature = "mbtiles",
     feature = "unstable-cog",
+    feature = "zarr",
     feature = "styles",
     feature = "sprites",
     feature = "fonts",
@@ -104,6 +105,10 @@ pub struct Config {
     #[cfg(feature = "unstable-cog")]
     #[serde(default, skip_serializing_if = "FileConfigEnum::is_none")]
     pub cog: FileConfigEnum<super::cog::CogConfig>,
+
+    #[cfg(feature = "zarr")]
+    #[serde(default, skip_serializing_if = "FileConfigEnum::is_none")]
+    pub zarr: FileConfigEnum<super::zarr::ZarrConfig>,
 
     #[cfg(feature = "sprites")]
     #[serde(default, skip_serializing_if = "FileConfigEnum::is_none")]
@@ -371,6 +376,13 @@ impl Config {
         if !self.cog.is_empty() {
             let cfg = &mut self.cog;
             let val = crate::config::file::resolve_files(cfg, idr, &["tif", "tiff"]);
+            sources_and_warnings.push(Box::pin(val));
+        }
+
+        #[cfg(feature = "zarr")]
+        if !self.zarr.is_empty() {
+            let cfg = &mut self.zarr;
+            let val = crate::config::file::resolve_files(cfg, idr, &["zarr"]);
             sources_and_warnings.push(Box::pin(val));
         }
 

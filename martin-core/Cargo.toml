@@ -36,7 +36,14 @@ postgres = [
 ]
 unstable-cog = ["dep:png", "dep:tiff", "_tiles"]
 unstable-rendering = ["styles", "dep:maplibre_native", "dep:image"]
-zarr = ["dep:zarrs", "dep:proj", "_tiles"]
+zarr = [
+    "dep:zarrs",
+    "dep:proj",
+    "dep:image",
+    "dep:ndarray",
+    "dep:chrono",
+    "_tiles",
+]
 fonts = [
     "dep:bit-set",
     "dep:pbf_font_tools",
@@ -66,13 +73,16 @@ actix-web = { workspace = true, optional = true }
 async-trait.workspace = true
 base64 = { workspace = true, optional = true }
 bit-set = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
 itertools = { workspace = true, optional = true }
 martin-tile-utils.workspace = true
 mbtiles = { workspace = true, optional = true }
 moka.workspace = true
+ndarray = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }
 pbf_font_tools = { workspace = true, optional = true }
 pmtiles = { workspace = true, optional = true }

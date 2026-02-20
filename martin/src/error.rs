@@ -54,6 +54,10 @@ pub enum MartinError {
     #[error(transparent)]
     CogError(#[from] martin_core::tiles::cog::CogError),
 
+    #[cfg(feature = "zarr")]
+    #[error(transparent)]
+    ZarrError(#[from] martin_core::tiles::zarr::error::ZarrError),
+
     #[error(transparent)]
     ConfigFileError(#[from] crate::config::file::ConfigFileError),
 

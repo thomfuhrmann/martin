@@ -1,3 +1,3 @@
-mod source;
-mod model;
-mod error;
+pub mod error;
+pub mod source;
+mod utils;

@@ -46,6 +46,7 @@ base64 = "0.22.1"
 bit-set = "0.8"
 brotli = ">=5, <9"
 bytes = "1"
+chrono = "0.4.43"
 clap = { version = "4", features = [
     "derive",
     "unstable-markdown",
@@ -76,6 +77,7 @@ martin-tile-utils = { path = "./martin-tile-utils", version = "0.6.9" }
 mbtiles = { path = "./mbtiles", version = "0.15.1" }
 md5 = "0.8.0"
 moka = { version = "0.12", features = ["future"] }
+ndarray = "0.17.2"
 num_cpus = "1"
 object_store = { version = "0.13.1", features = [
     "gcp",
