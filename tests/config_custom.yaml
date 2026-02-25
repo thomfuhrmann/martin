@@ -1,0 +1,33 @@
+---
+# Connection keep alive timeout [default: 75]
+keep_alive: 75
+
+# The socket address to bind [default: 0.0.0.0:3000]
+listen_addresses: "0.0.0.0:3000"
+
+# Number of web server workers
+worker_processes: 8
+
+# Amount of memory (in MB) to use for caching tiles [default: 512, 0 to disable]
+cache_size_mb: 8
+
+zarr:
+  paths:
+    - tests/fixtures/zarr/snowgrid
+
+fonts:
+  - tests/fixtures/fonts/overpass-mono-regular.ttf
+  - tests/fixtures/fonts
+
+styles:
+  sources:
+    maplibre: tests/fixtures/styles/maplibre_demo.json
+  paths:
+    - tests/fixtures/styles/src2
+
+sprites:
+  paths: tests/fixtures/sprites/src1
+  sources:
+    mysrc: tests/fixtures/sprites/src2
+
+tilejson_url_version_param: version

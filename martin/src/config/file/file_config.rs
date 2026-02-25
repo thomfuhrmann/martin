@@ -417,6 +417,7 @@ async fn resolve_one_path_int<T: TileSourceConfiguration>(
                 path.canonicalize().unwrap_or(path),
             )));
         };
+
         for path in dir_files {
             let can = path
                 .canonicalize()

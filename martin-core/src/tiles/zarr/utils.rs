@@ -1,17 +1,55 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use core::f64;
 use image::{ImageBuffer, LumaA};
-use std::{
-    error::Error,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{error::Error, sync::Arc};
 use zarrs::{
-    array::Array, filesystem::FilesystemStore, group::Group, node::NodePath, plugin::ZarrVersion,
+    array::{Array, ArrayMetadata},
+    filesystem::FilesystemStore,
+    group::{Group, GroupMetadata},
+    node::{Node, NodeMetadata, NodePath, get_child_nodes},
+    plugin::ZarrVersion,
 };
 
-pub fn open_zarr(root_path: PathBuf) -> Result<(), Box<dyn Error>> {
-    let store = Arc::new(FilesystemStore::new(&root_path)?);
+pub fn enumerate_data_variables(
+    store: Arc<FilesystemStore>,
+) -> Result<Vec<NodePath>, Box<dyn Error>> {
+    let root_path = NodePath::root();
+    let root_group = Group::open(store.clone(), root_path.as_str())?;
+    let attributes = root_group.attributes();
+    let crs_path = attributes
+        .get("coordinates")
+        .map(|v| v.as_str())
+        .flatten()
+        .map(|v| NodePath::new(&format!("/{}", v)))
+        .transpose()?
+        .ok_or("Could not retrieve coordinate information")?;
+
+    if let GroupMetadata::V2(group_metadata) = root_group.metadata() {
+        println!("{:?}", group_metadata.attributes);
+    }
+
+    let child_nodes = get_child_nodes(&store, &root_path, true)?;
+
+    let filtered_child_nodes = child_nodes
+        .into_iter()
+        .filter_map(|n| match is_data_variable(&n) {
+            Ok(true) => {
+                if n.path() != &crs_path {
+                    Some(Ok(n.path().clone()))
+                } else {
+                    None
+                }
+            }
+            Ok(false) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(filtered_child_nodes)
+}
+
+/// Get coordinate system definition as WKT-string
+pub fn get_wkt_string(store: Arc<FilesystemStore>) -> Result<String, Box<dyn Error>> {
     let root_path = NodePath::root();
     let root_group = Group::open(store.clone(), root_path.as_str())?;
     let attributes = root_group.attributes();
@@ -28,75 +66,79 @@ pub fn open_zarr(root_path: PathBuf) -> Result<(), Box<dyn Error>> {
         .map(|p| Array::open(store.clone(), p.as_str()))
         .transpose()?;
 
-    let crs_wkt: Option<String> = crs_array.and_then(|arr| {
-        arr.attributes()
-            .get("crs_wkt")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let crs_wkt = crs_array
+        .and_then(|arr| {
+            arr.attributes()
+                .get("crs_wkt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .ok_or("Could not retrieve WKT-string")?;
 
-    // Filter all non-dimension and non-crs variables
-    let children = root_group.child_arrays()?;
-    for array in &children {
-        let is_data_var = array_is_data_variable(array)?;
-        if is_data_var && !array_is_crs(array, &crs_path) {
-            println!("{:?}", array.path().as_str());
-            let path = array.path().as_str();
-
-            if path == "/airtemp" {
-                if let Some(crs_wkt) = crs_wkt {
-                    let tile = Tile::new(10, 558, 356);
-                    let time_str = "2026-02-03T00:00:00.000Z";
-                    let datetime = DateTime::parse_from_rfc3339(time_str)?;
-                    let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
-                    sample_data_var(
-                        &tile,
-                        store,
-                        "/x",
-                        "/y",
-                        "/time",
-                        array,
-                        &crs_wkt,
-                        datetime_utc,
-                    )?;
-                }
-                break;
-            }
-        }
-    }
-
-    Ok(())
+    Ok(crs_wkt)
 }
 
 /// Check if the array is a NetCDF data variable
-fn array_is_data_variable(array: &Array<FilesystemStore>) -> Result<bool, Box<dyn Error>> {
-    let array_path = array.path().as_path();
+fn is_data_variable(node: &Node) -> Result<bool, Box<dyn Error>> {
+    let metadata = node.metadata();
+    let path = node.path().as_str();
+    match metadata {
+        NodeMetadata::Array(array_metadata) => match array_metadata {
+            ArrayMetadata::V2(_) => panic!("Zarr V2 not implemented yet"),
+            ArrayMetadata::V3(metadata_v3) => {
+                if let Some(dim_names) = &metadata_v3.dimension_names {
+                    let is_coord = dim_names.iter().any(|dim_name| {
+                        if let Some(dim) = dim_name
+                            && path.ends_with(dim)
+                        {
+                            true
+                        } else {
+                            false
+                        }
+                    });
+
+                    return Ok(!is_coord);
+                } else {
+                    return Ok(false);
+                }
+            }
+        },
+        NodeMetadata::Group(_) => return Ok(false),
+    }
+}
+
+pub fn get_spatial_dims(array: &Array<FilesystemStore>) -> Vec<&str> {
+    array
+        .attributes()
+        .get("coordinates")
+        .map(|v| v.as_str())
+        .flatten()
+        .map(|s| s.split(" ").collect::<Vec<_>>())
+        .unwrap_or(vec![])
+}
+
+pub fn get_non_spatial_dims(
+    array: &Array<FilesystemStore>,
+    spatial_dims: &Vec<&str>,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut non_spatial = vec![];
+
     let dim_names = array
         .dimension_names()
         .as_ref()
         .ok_or("Could not retrieve dimension names")?;
 
-    let is_coord = dim_names.iter().any(|dim_name| {
-        if let Some(dim) = dim_name
-            && array_path.ends_with(dim)
-        {
-            true
-        } else {
-            false
+    for dim_name in dim_names {
+        if let Some(name) = dim_name {
+            let spatial = spatial_dims.iter().any(|&spatial_dim| spatial_dim == name);
+
+            if !spatial {
+                non_spatial.push(name.clone());
+            }
         }
-    });
+    }
 
-    Ok(!is_coord)
-}
-
-/// Check if array contains coordinate system information
-fn array_is_crs(array: &Array<FilesystemStore>, crs_path: &Option<NodePath>) -> bool {
-    let crs_path = crs_path
-        .as_ref()
-        .map(|p| p.as_path())
-        .unwrap_or(Path::new(""));
-    let array_path = array.path().as_path();
-    crs_path == array_path
+    Ok(non_spatial)
 }
 
 const TILE_PIXELS: u32 = 256;
@@ -219,7 +261,6 @@ fn sample_data_var(
 
     // Load tile data into memory
     let temporal_index = get_temporal_index(store.clone(), path_time, datetime)? as u64;
-    println!("{temporal_index}");
     let tile_data = data_var.retrieve_array_subset::<ndarray::Array3<f32>>(&[
         temporal_index..temporal_index + 1,
         y_range,
@@ -424,12 +465,15 @@ fn find_closest_binary(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
     fn test_open_zarr() {
         let path = PathBuf::from(r".\tests\fixtures\latest");
-        let _ = open_zarr(path);
+        let store = Arc::new(FilesystemStore::new(&path).unwrap());
+        let _ = enumerate_data_variables(store);
     }
 
     // 10/558/356

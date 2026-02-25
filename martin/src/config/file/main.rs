@@ -219,6 +219,9 @@ impl Config {
         #[cfg(feature = "unstable-cog")]
         let is_empty = is_empty && self.cog.is_empty();
 
+        #[cfg(feature = "zarr")]
+        let is_empty = is_empty && self.zarr.is_empty();
+
         #[cfg(feature = "sprites")]
         let is_empty = is_empty && self.sprites.is_empty();
 
@@ -381,9 +384,8 @@ impl Config {
 
         #[cfg(feature = "zarr")]
         if !self.zarr.is_empty() {
-            let cfg = &mut self.zarr;
-            let val = crate::config::file::resolve_files(cfg, idr, &["zarr"]);
-            sources_and_warnings.push(Box::pin(val));
+            use crate::config::file::zarr::ZarrConfig;
+            sources_and_warnings.push(Box::pin(ZarrConfig::resolve(&mut self.zarr, idr.clone())));
         }
 
         let all_results = try_join_all(sources_and_warnings).await?;
