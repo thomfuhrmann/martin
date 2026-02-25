@@ -13,20 +13,20 @@ use tracing::info;
 use zarrs::array::Array;
 
 use crate::tiles::zarr::error::ZarrError;
-use crate::tiles::zarr::utils::{enumerate_data_variables, get_wkt_string};
-use crate::tiles::{MartinCoreResult, Source, UrlQuery, zarr};
+use crate::tiles::zarr::utils::{
+    enumerate_data_variables, get_array_data_f64, get_spatial_dims, get_wkt_string, sample_data_var,
+};
+use crate::tiles::{MartinCoreResult, Source, UrlQuery};
 use zarrs::filesystem::FilesystemStore;
 
 /// Tile source that reads from `Zarr` stores
 #[derive(Clone, Debug)]
 pub struct ZarrSource {
     id: String,
-    path: PathBuf,
     tilejson: TileJSON,
     tileinfo: TileInfo,
     min_zoom: u8,
     max_zoom: u8,
-    zarr_store: Arc<FilesystemStore>,
     x_coords: Arc<Array<FilesystemStore>>,
     y_coords: Arc<Array<FilesystemStore>>,
     time_coords: Arc<Array<FilesystemStore>>,
@@ -44,13 +44,20 @@ impl ZarrSource {
                 .map_err(|e| ZarrError::FilesystemStoreCreateError(e, path.clone()))?,
         );
 
-        let x_coords = Array::open(zarr_store.clone(), "/x")?;
-        let y_coords = Array::open(zarr_store.clone(), "/y")?;
-        let time_coords = Array::open(zarr_store.clone(), "/time")?;
+        let x_coords =
+            Array::open(zarr_store.clone(), "/x").map_err(|e| ZarrError::ArrayCreateError(e))?;
+        let y_coords =
+            Array::open(zarr_store.clone(), "/y").map_err(|e| ZarrError::ArrayCreateError(e))?;
+        let time_coords =
+            Array::open(zarr_store.clone(), "/time").map_err(|e| ZarrError::ArrayCreateError(e))?;
         let mut data_vars = HashMap::new();
         let node_paths = enumerate_data_variables(zarr_store.clone())?;
         for node_path in node_paths {
-            let array = Array::open(zarr_store.clone(), node_path.as_str())?;
+            let array = Array::open(zarr_store.clone(), node_path.as_str())
+                .map_err(|e| ZarrError::ArrayCreateError(e))?;
+
+            // calculate min and max values for normalization
+            let values = get_array_data_f64(&array)?;
             data_vars.insert(node_path.as_str().into(), array);
         }
         let wkt_str = get_wkt_string(zarr_store.clone())?;
@@ -65,12 +72,10 @@ impl ZarrSource {
 
         Ok(ZarrSource {
             id,
-            path,
             tilejson,
             tileinfo,
             min_zoom,
             max_zoom,
-            zarr_store,
             x_coords: Arc::new(x_coords),
             y_coords: Arc::new(y_coords),
             time_coords: Arc::new(time_coords),
@@ -132,9 +137,22 @@ impl Source for ZarrSource {
 
         let time_str = "2026-02-17T00:00:00.000Z";
         let data_var = "/snow_depth";
-        if xyz.z < self.min_zoom || xyz.z > self.max_zoom {
-            return Ok(Vec::new());
+        if xyz.z >= self.min_zoom || xyz.z <= self.max_zoom {
+            let data_var = self.data_vars.get(data_var).unwrap();
+            let datetime = DateTime::parse_from_rfc3339(time_str).unwrap();
+            let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
+            let data = sample_data_var(
+                &xyz,
+                &self.x_coords,
+                &self.y_coords,
+                &self.time_coords,
+                data_var,
+                &self.wkt_str,
+                datetime_utc,
+            )?;
+            return Ok(data);
         }
+
         Ok(Vec::new())
     }
 }

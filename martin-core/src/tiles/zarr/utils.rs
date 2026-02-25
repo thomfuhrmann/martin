@@ -1,6 +1,8 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use core::f64;
 use image::{ImageBuffer, LumaA};
+use martin_tile_utils::TileCoord;
+use ndarray::{ArrayBase, Dim, OwnedRepr};
 use std::{error::Error, sync::Arc};
 use zarrs::{
     array::{Array, ArrayMetadata},
@@ -10,61 +12,69 @@ use zarrs::{
     plugin::ZarrVersion,
 };
 
-pub fn enumerate_data_variables(
-    store: Arc<FilesystemStore>,
-) -> Result<Vec<NodePath>, Box<dyn Error>> {
+use crate::tiles::zarr::error::ZarrError;
+
+pub fn enumerate_data_variables(store: Arc<FilesystemStore>) -> Result<Vec<NodePath>, ZarrError> {
     let root_path = NodePath::root();
-    let root_group = Group::open(store.clone(), root_path.as_str())?;
+    let root_group = Group::open(store.clone(), root_path.as_str())
+        .map_err(|e| ZarrError::GroupCreateError(e))?;
     let attributes = root_group.attributes();
-    let crs_path = attributes
+    let Some(crs_path) = attributes
         .get("coordinates")
         .map(|v| v.as_str())
         .flatten()
         .map(|v| NodePath::new(&format!("/{}", v)))
-        .transpose()?
-        .ok_or("Could not retrieve coordinate information")?;
+        .transpose()
+        .map_err(|e| ZarrError::NodePathError(e))?
+    else {
+        return Err(ZarrError::AttributeError(
+            "Can not retrieve CRS path".into(),
+        ));
+    };
 
-    if let GroupMetadata::V2(group_metadata) = root_group.metadata() {
-        println!("{:?}", group_metadata.attributes);
+    if let GroupMetadata::V2(_group_metadata) = root_group.metadata() {
+        panic!("Zarr V2 is not supported");
     }
 
-    let child_nodes = get_child_nodes(&store, &root_path, true)?;
-
+    let child_nodes =
+        get_child_nodes(&store, &root_path, true).map_err(|e| ZarrError::NodeCreateError(e))?;
     let filtered_child_nodes = child_nodes
         .into_iter()
         .filter_map(|n| match is_data_variable(&n) {
-            Ok(true) => {
+            true => {
                 if n.path() != &crs_path {
-                    Some(Ok(n.path().clone()))
+                    Some(n.path().clone())
                 } else {
                     None
                 }
             }
-            Ok(false) => None,
-            Err(e) => Some(Err(e)),
+            false => None,
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
 
     Ok(filtered_child_nodes)
 }
 
 /// Get coordinate system definition as WKT-string
-pub fn get_wkt_string(store: Arc<FilesystemStore>) -> Result<String, Box<dyn Error>> {
+pub fn get_wkt_string(store: Arc<FilesystemStore>) -> Result<String, ZarrError> {
     let root_path = NodePath::root();
-    let root_group = Group::open(store.clone(), root_path.as_str())?;
+    let root_group = Group::open(store.clone(), root_path.as_str())
+        .map_err(|e| ZarrError::GroupCreateError(e))?;
     let attributes = root_group.attributes();
     let crs_path = attributes
         .get("coordinates")
         .map(|v| v.as_str())
         .flatten()
         .map(|v| NodePath::new(&format!("/{}", v)))
-        .transpose()?;
+        .transpose()
+        .map_err(|e| ZarrError::NodePathError(e))?;
 
     // Get WKT for projection information
     let crs_array = crs_path
         .clone()
         .map(|p| Array::open(store.clone(), p.as_str()))
-        .transpose()?;
+        .transpose()
+        .map_err(|e| ZarrError::ArrayCreateError(e))?;
 
     let crs_wkt = crs_array
         .and_then(|arr| {
@@ -73,13 +83,13 @@ pub fn get_wkt_string(store: Arc<FilesystemStore>) -> Result<String, Box<dyn Err
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         })
-        .ok_or("Could not retrieve WKT-string")?;
+        .ok_or(ZarrError::WktError("Could not retrieve WKT-string".into()))?;
 
     Ok(crs_wkt)
 }
 
 /// Check if the array is a NetCDF data variable
-fn is_data_variable(node: &Node) -> Result<bool, Box<dyn Error>> {
+fn is_data_variable(node: &Node) -> bool {
     let metadata = node.metadata();
     let path = node.path().as_str();
     match metadata {
@@ -97,13 +107,13 @@ fn is_data_variable(node: &Node) -> Result<bool, Box<dyn Error>> {
                         }
                     });
 
-                    return Ok(!is_coord);
+                    return !is_coord;
                 } else {
-                    return Ok(false);
+                    return false;
                 }
             }
         },
-        NodeMetadata::Group(_) => return Ok(false),
+        NodeMetadata::Group(_) => return false,
     }
 }
 
@@ -141,50 +151,60 @@ pub fn get_non_spatial_dims(
     Ok(non_spatial)
 }
 
+pub fn get_array_data_f64(
+    array: &Array<FilesystemStore>,
+) -> Result<ArrayBase<OwnedRepr<f64>, Dim<[usize; 1]>, f64>, ZarrError> {
+    let data_type = array.data_type();
+    let name = data_type.name(ZarrVersion::V3);
+    let data = match name.as_deref() {
+        Some("int32") => array
+            .retrieve_array_subset::<ndarray::Array1<i32>>(&array.subset_all())
+            .map_err(|e| ZarrError::ArrayError(e))?
+            .mapv(|v| v as f64),
+        Some("int64") => array
+            .retrieve_array_subset::<ndarray::Array1<i64>>(&array.subset_all())
+            .map_err(|e| ZarrError::ArrayError(e))?
+            .mapv(|v| v as f64),
+        Some("float32") => array
+            .retrieve_array_subset::<ndarray::Array1<f32>>(&array.subset_all())
+            .map_err(|e| ZarrError::ArrayError(e))?
+            .mapv(|v| v as f64),
+        Some("float64") => array
+            .retrieve_array_subset::<ndarray::Array1<f64>>(&array.subset_all())
+            .map_err(|e| ZarrError::ArrayError(e))?,
+        _ => unimplemented!("Data type not implemented yet"),
+    };
+    Ok(data)
+}
+
 const TILE_PIXELS: u32 = 256;
 const SOURCE_CRS: &str = "EPSG:3857";
 
-#[derive(Debug)]
-pub struct Tile {
-    zoom: u8,
-    x: u32,
-    y: u32,
-}
-
-impl Tile {
-    fn new(zoom: u8, x: u32, y: u32) -> Self {
-        Tile { zoom, x, y }
-    }
-}
-
 /// Sample from array using a coordinate transformation
-fn sample_data_var(
-    tile: &Tile,
-    store: Arc<FilesystemStore>,
-    path_x: &str,
-    path_y: &str,
-    path_time: &str,
+pub fn sample_data_var(
+    tile: &TileCoord,
+    x_coords: &Array<FilesystemStore>,
+    y_coords: &Array<FilesystemStore>,
+    time_coords: &Array<FilesystemStore>,
     data_var: &Array<FilesystemStore>,
     wkt_str: &str,
     datetime: DateTime<Utc>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Vec<u8>, Box<dyn Error>> {
     // Load data for x-coordinates
-    let array_x = Array::open(store.clone(), path_x)?;
-    let data_type = array_x.data_type();
+    let data_type = x_coords.data_type();
     let name = data_type.name(ZarrVersion::V3);
     let data_x = match name.as_deref() {
-        Some("int64") => array_x
+        Some("int64") => x_coords
             .retrieve_array_subset::<ndarray::Array1<i64>>(&[0..2])?
             .mapv(|v| v as f64),
         _ => unimplemented!("Data type not implemented yet"),
     };
 
     // Load data for y-coordinates
-    let array_y = Array::open(store.clone(), path_y)?;
-    let data_type = array_y.data_type();
+    let data_type = y_coords.data_type();
     let name = data_type.name(ZarrVersion::V3);
     let data_y = match name.as_deref() {
-        Some("int64") => array_y
+        Some("int64") => y_coords
             .retrieve_array_subset::<ndarray::Array1<i64>>(&[0..2])?
             .mapv(|v| v as f64),
         _ => unimplemented!("Data type not implemented yet"),
@@ -201,7 +221,7 @@ fn sample_data_var(
     let transformer = proj::Proj::try_from((SOURCE_CRS, wkt_str))?;
 
     // Get tile bounding box in Web Mercator
-    let tile = tile_bbox(tile.x, tile.y, tile.zoom);
+    let tile = tile_bbox(tile.x, tile.y, tile.z);
     let x_min_source = tile[0];
     let y_min_source = tile[1];
     let x_max_source = tile[2];
@@ -234,7 +254,13 @@ fn sample_data_var(
     let mut min_iy = bl_iy.min(br_iy).min(tl_iy).min(tr_iy);
     let mut max_iy = bl_iy.max(br_iy).max(tl_iy).max(tr_iy);
 
-    // Swap indices if y-coordinate array is in descending order
+    // Swap indices if coordinate array is in descending order
+    if min_ix > max_ix {
+        let temp = min_ix;
+        min_ix = max_ix;
+        max_ix = temp;
+    }
+
     if min_iy > max_iy {
         let temp = min_iy;
         min_iy = max_iy;
@@ -249,18 +275,18 @@ fn sample_data_var(
     max_iy = max_iy.saturating_add(buffer);
 
     // Set index ranges
-    let target_width = array_x.shape()[0];
-    let x_range_start = min_ix;
+    let target_width = x_coords.shape()[0];
+    let x_range_start = min_ix.min(target_width);
     let x_range_end = (max_ix + 1).min(target_width);
     let x_range = x_range_start..x_range_end;
 
-    let target_height = array_y.shape()[0];
-    let y_range_start = min_iy;
+    let target_height = y_coords.shape()[0];
+    let y_range_start = min_iy.min(target_height);
     let y_range_end = (max_iy + 1).min(target_height);
     let y_range = y_range_start..y_range_end;
 
     // Load tile data into memory
-    let temporal_index = get_temporal_index(store.clone(), path_time, datetime)? as u64;
+    let temporal_index = get_temporal_index(time_coords, datetime)? as u64;
     let tile_data = data_var.retrieve_array_subset::<ndarray::Array3<f32>>(&[
         temporal_index..temporal_index + 1,
         y_range,
@@ -301,7 +327,7 @@ fn sample_data_var(
                     max = value;
                 }
 
-                sampled_data[i as usize][j as usize] = Some(value);
+                sampled_data[j as usize][i as usize] = Some(value);
             }
         }
     }
@@ -327,10 +353,12 @@ fn sample_data_var(
         }
     }
 
-    // Save image
-    img.save("output.png")?;
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buffer, image::ImageFormat::Png)
+        .expect("Failed to encode PNG");
+    let png_bytes = buffer.into_inner();
 
-    Ok(())
+    Ok(png_bytes)
 }
 
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
@@ -394,12 +422,10 @@ impl TimeMetadata {
 }
 
 fn get_temporal_index(
-    store: Arc<FilesystemStore>,
-    time_path: &str,
+    array_time: &Array<FilesystemStore>,
     datetime: DateTime<Utc>,
 ) -> Result<usize, Box<dyn Error>> {
     // Load time data
-    let array_time = Array::open(store.clone(), time_path)?;
     let data_type = array_time.data_type();
     let name = data_type.name(ZarrVersion::V3);
     let data_time = match name.as_deref() {
@@ -483,7 +509,7 @@ mod tests {
         let wkt = r#"PROJCRS["MGI / Austria Lambert",BASEGEOGCRS["MGI",DATUM["Militar-Geographische Institut",ELLIPSOID["Bessel 1841",6377397.155,299.1528128,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4312]],CONVERSION["unnamed",METHOD["Lambert Conic Conformal (2SP)",ID["EPSG",9802]],PARAMETER["Latitude of false origin",47.5,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8821]],PARAMETER["Longitude of false origin",13.3333333333333,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8822]],PARAMETER["Latitude of 1st standard parallel",49,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8823]],PARAMETER["Latitude of 2nd standard parallel",46,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8824]],PARAMETER["Easting at false origin",400000,LENGTHUNIT["metre",1],ID["EPSG",8826]],PARAMETER["Northing at false origin",400000,LENGTHUNIT["metre",1],ID["EPSG",8827]]],CS[Cartesian,2],AXIS["northing",north,ORDER[1],LENGTHUNIT["metre",1]],AXIS["easting",east,ORDER[2],LENGTHUNIT["metre",1]],ID["EPSG",31287]]"#;
         let path = PathBuf::from(r".\tests\fixtures\latest");
         let store = Arc::new(FilesystemStore::new(&path).unwrap());
-        let tile = Tile::new(10, 558, 356);
+        let tile = TileCoord::new_checked(10, 558, 356).unwrap();
         let data_var = Array::open(store.clone(), "/snow_depth").unwrap();
 
         // time
@@ -491,12 +517,14 @@ mod tests {
         let datetime = DateTime::parse_from_rfc3339(time_str).unwrap();
         let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
 
+        let x_coords = Array::open(store.clone(), "/x").unwrap();
+        let y_coords = Array::open(store.clone(), "/y").unwrap();
+        let time_coords = Array::open(store.clone(), "/time").unwrap();
         let res = sample_data_var(
             &tile,
-            store,
-            "/x",
-            "/y",
-            "/time",
+            &x_coords,
+            &y_coords,
+            &time_coords,
             &data_var,
             wkt,
             datetime_utc,

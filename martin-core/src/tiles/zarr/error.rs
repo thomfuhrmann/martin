@@ -15,4 +15,25 @@ pub enum ZarrError {
         #[source] zarrs::filesystem::FilesystemStoreCreateError,
         PathBuf,
     ),
+    /// Zarr array error
+    #[error("Zarr array error: {0}")]
+    ArrayError(#[source] zarrs::array::ArrayError),
+    /// Zarr array error
+    #[error("Zarr array create error: {0}")]
+    ArrayCreateError(#[source] zarrs::array::ArrayCreateError),
+    /// Zarr group create error
+    #[error("Zarr group create error: {0}")]
+    GroupCreateError(#[source] zarrs::group::GroupCreateError),
+    /// Zarr node path error
+    #[error("Zarr node path error: {0}")]
+    NodePathError(#[source] zarrs::node::NodePathError),
+    /// Zarr node create error
+    #[error("Zarr node create error: {0}")]
+    NodeCreateError(#[source] zarrs::node::NodeCreateError),
+    /// Zarr WKT error
+    #[error("WKT error: {0}")]
+    WktError(String),
+    /// Zarr attribute error
+    #[error("Zarr attribute error: {0}")]
+    AttributeError(String),
 }
