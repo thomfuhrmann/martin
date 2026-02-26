@@ -2,15 +2,15 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use core::f64;
 use image::{ImageBuffer, LumaA};
 use martin_tile_utils::TileCoord;
-use ndarray::{ArrayBase, Dim, OwnedRepr};
-use std::{error::Error, sync::Arc};
+use std::{error::Error, ops::Range, sync::Arc};
 use zarrs::{
-    array::{Array, ArrayMetadata},
+    array::{Array, ArrayMetadata, DimensionName},
     filesystem::FilesystemStore,
     group::{Group, GroupMetadata},
     node::{Node, NodeMetadata, NodePath, get_child_nodes},
     plugin::ZarrVersion,
 };
+use zstd::encode_all;
 
 use crate::tiles::zarr::error::ZarrError;
 
@@ -151,32 +151,6 @@ pub fn get_non_spatial_dims(
     Ok(non_spatial)
 }
 
-pub fn get_array_data_f64(
-    array: &Array<FilesystemStore>,
-) -> Result<ArrayBase<OwnedRepr<f64>, Dim<[usize; 1]>, f64>, ZarrError> {
-    let data_type = array.data_type();
-    let name = data_type.name(ZarrVersion::V3);
-    let data = match name.as_deref() {
-        Some("int32") => array
-            .retrieve_array_subset::<ndarray::Array1<i32>>(&array.subset_all())
-            .map_err(|e| ZarrError::ArrayError(e))?
-            .mapv(|v| v as f64),
-        Some("int64") => array
-            .retrieve_array_subset::<ndarray::Array1<i64>>(&array.subset_all())
-            .map_err(|e| ZarrError::ArrayError(e))?
-            .mapv(|v| v as f64),
-        Some("float32") => array
-            .retrieve_array_subset::<ndarray::Array1<f32>>(&array.subset_all())
-            .map_err(|e| ZarrError::ArrayError(e))?
-            .mapv(|v| v as f64),
-        Some("float64") => array
-            .retrieve_array_subset::<ndarray::Array1<f64>>(&array.subset_all())
-            .map_err(|e| ZarrError::ArrayError(e))?,
-        _ => unimplemented!("Data type not implemented yet"),
-    };
-    Ok(data)
-}
-
 const TILE_PIXELS: u32 = 256;
 const SOURCE_CRS: &str = "EPSG:3857";
 
@@ -194,20 +168,34 @@ pub fn sample_data_var(
     let data_type = x_coords.data_type();
     let name = data_type.name(ZarrVersion::V3);
     let data_x = match name.as_deref() {
+        Some("int32") => x_coords
+            .retrieve_array_subset::<ndarray::Array1<i32>>(&[0..2])?
+            .mapv(|v| v as f64),
         Some("int64") => x_coords
             .retrieve_array_subset::<ndarray::Array1<i64>>(&[0..2])?
             .mapv(|v| v as f64),
-        _ => unimplemented!("Data type not implemented yet"),
+        Some("float32") => x_coords
+            .retrieve_array_subset::<ndarray::Array1<f32>>(&[0..2])?
+            .mapv(|v| v as f64),
+        Some("float64") => x_coords.retrieve_array_subset::<ndarray::Array1<f64>>(&[0..2])?,
+        _ => panic!("Data type not implemented yet"),
     };
 
     // Load data for y-coordinates
     let data_type = y_coords.data_type();
     let name = data_type.name(ZarrVersion::V3);
     let data_y = match name.as_deref() {
+        Some("int32") => y_coords
+            .retrieve_array_subset::<ndarray::Array1<i32>>(&[0..2])?
+            .mapv(|v| v as f64),
         Some("int64") => y_coords
             .retrieve_array_subset::<ndarray::Array1<i64>>(&[0..2])?
             .mapv(|v| v as f64),
-        _ => unimplemented!("Data type not implemented yet"),
+        Some("float32") => y_coords
+            .retrieve_array_subset::<ndarray::Array1<f32>>(&[0..2])?
+            .mapv(|v| v as f64),
+        Some("float64") => y_coords.retrieve_array_subset::<ndarray::Array1<f64>>(&[0..2])?,
+        _ => panic!("Data type not implemented yet"),
     };
 
     // Calculate spatial origin and spacing of array data
@@ -287,18 +275,26 @@ pub fn sample_data_var(
 
     // Load tile data into memory
     let temporal_index = get_temporal_index(time_coords, datetime)? as u64;
-    let tile_data = data_var.retrieve_array_subset::<ndarray::Array3<f32>>(&[
-        temporal_index..temporal_index + 1,
-        y_range,
-        x_range,
-    ])?;
+    let temporal_range = temporal_index..temporal_index + 1;
+
+    // Permute tile data to have a fixed order: time, x, y
+    let dimension_names = data_var.dimension_names();
+    let indices = build_subset(dimension_names, temporal_range, x_range, y_range);
+    let perm = order_dimensions(dimension_names);
+    let tile_data = data_var
+        .retrieve_array_subset::<ndarray::Array3<f32>>(&[
+            indices[0].clone(),
+            indices[1].clone(),
+            indices[2].clone(),
+        ])?
+        .permuted_axes(perm);
 
     // Sample from array at tile grid points
     let width = x_range_end - x_range_start;
     let height = y_range_end - y_range_start;
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
-    let mut sampled_data = [[None; TILE_PIXELS as usize]; TILE_PIXELS as usize];
+    let mut sampled_data = [f32::NAN; TILE_PIXELS as usize * TILE_PIXELS as usize];
     for i in 0..TILE_PIXELS {
         for j in 0..TILE_PIXELS {
             let x = x_min_source + (f64::from(i) + 0.5) * spacing_x_source;
@@ -307,7 +303,7 @@ pub fn sample_data_var(
             // Transform from Web Mercator to target system
             let (xt, yt) = transformer.convert((x, y))?;
 
-            // Index calculation:
+            // Index calculation
             // use i64 for intermediate calculations to handle coordinates
             // that might fall outside min_ix/min_iy
             let abs_ix = ((xt - x_0) / spacing_x).round() as i64;
@@ -319,7 +315,7 @@ pub fn sample_data_var(
 
             // Bounds check and sample
             if rel_ix >= 0 && rel_ix < width as i64 && rel_iy >= 0 && rel_iy < height as i64 {
-                let value = tile_data[[0, rel_iy as usize, rel_ix as usize]];
+                let value = tile_data[[0, rel_ix as usize, rel_iy as usize]];
                 if value < min {
                     min = value;
                 }
@@ -327,38 +323,60 @@ pub fn sample_data_var(
                     max = value;
                 }
 
-                sampled_data[j as usize][i as usize] = Some(value);
+                sampled_data[(j as usize) * TILE_PIXELS as usize + i as usize] = value;
             }
         }
     }
 
-    // Create a new ImageBuffer.
-    let mut img = ImageBuffer::new(TILE_PIXELS, TILE_PIXELS);
+    // Cast to raw bytes
+    let raw_bytes = bytemuck::cast_slice::<f32, u8>(&sampled_data);
 
-    // Iterate over the array and convert f64 to u8
-    for (y, row) in sampled_data.iter().enumerate() {
-        for (x, &value) in row.iter().enumerate() {
-            // Normalize, scale to 0-255 and clamp
-            let pixel_val = value
-                .map(|v| (v - min) / (max - min))
-                .map(|v| (v * 255.0).clamp(0.0, 255.0) as u8)
-                .unwrap_or(0);
+    // Compress with Zstd
+    let compressed_bytes = encode_all(raw_bytes, 3)?;
+    Ok(compressed_bytes)
+}
 
-            let alpha = if value.is_some() { 255 } else { 0 };
-            img.put_pixel(
-                x as u32,
-                (TILE_PIXELS - 1) - y as u32,
-                LumaA([pixel_val, alpha]),
-            );
+fn build_subset(
+    dimension_names: &Option<Vec<DimensionName>>,
+    time: Range<u64>,
+    x: Range<u64>,
+    y: Range<u64>,
+) -> Vec<Range<u64>> {
+    match dimension_names {
+        Some(names) => names
+            .iter()
+            .map(|name| match name.as_deref() {
+                Some("time") => time.clone(),
+                Some("y") => y.clone(),
+                Some("x") => x.clone(),
+                _ => panic!("Unknown dimension in metadata: {:?}", name),
+            })
+            .collect(),
+        None => {
+            vec![time, x, y]
         }
     }
+}
 
-    let mut buffer = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut buffer, image::ImageFormat::Png)
-        .expect("Failed to encode PNG");
-    let png_bytes = buffer.into_inner();
-
-    Ok(png_bytes)
+fn order_dimensions(dimension_names: &Option<Vec<DimensionName>>) -> [usize; 3] {
+    match dimension_names {
+        Some(names) => {
+            let t_axis = names
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|v| v == "time"))
+                .unwrap_or(0);
+            let x_axis = names
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|v| v == "x"))
+                .unwrap_or(1);
+            let y_axis = names
+                .iter()
+                .position(|s| s.as_ref().is_some_and(|v| v == "y"))
+                .unwrap_or(2);
+            [t_axis, x_axis, y_axis]
+        }
+        None => [0, 1, 2],
+    }
 }
 
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
@@ -375,7 +393,7 @@ pub fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
 struct TimeMetadata {
     units: String,
     epoch: DateTime<Utc>,
-    calendar: String,
+    _calendar: String,
 }
 
 impl TimeMetadata {
@@ -416,26 +434,29 @@ impl TimeMetadata {
         Ok(TimeMetadata {
             units: unit_type,
             epoch,
-            calendar: calendar.to_string(),
+            _calendar: calendar.to_string(),
         })
     }
 }
 
 fn get_temporal_index(
-    array_time: &Array<FilesystemStore>,
+    time_coords: &Array<FilesystemStore>,
     datetime: DateTime<Utc>,
 ) -> Result<usize, Box<dyn Error>> {
     // Load time data
-    let data_type = array_time.data_type();
+    let data_type = time_coords.data_type();
     let name = data_type.name(ZarrVersion::V3);
     let data_time = match name.as_deref() {
+        Some("float32") => time_coords
+            .retrieve_array_subset::<ndarray::Array1<f32>>(&time_coords.subset_all())?
+            .mapv(|v| v as f64),
         Some("float64") => {
-            array_time.retrieve_array_subset::<ndarray::Array1<f64>>(&array_time.subset_all())?
+            time_coords.retrieve_array_subset::<ndarray::Array1<f64>>(&time_coords.subset_all())?
         }
         _ => unimplemented!("Data type not implemented yet"),
     };
 
-    let units = array_time.attributes().get("units").and_then(|v| {
+    let units = time_coords.attributes().get("units").and_then(|v| {
         if v.is_string() {
             return v.as_str();
         } else {
@@ -443,7 +464,7 @@ fn get_temporal_index(
         }
     });
 
-    let calendar = array_time.attributes().get("calendar").and_then(|v| {
+    let calendar = time_coords.attributes().get("calendar").and_then(|v| {
         if v.is_string() {
             return v.as_str();
         } else {

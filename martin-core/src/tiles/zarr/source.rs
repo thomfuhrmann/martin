@@ -13,9 +13,7 @@ use tracing::info;
 use zarrs::array::Array;
 
 use crate::tiles::zarr::error::ZarrError;
-use crate::tiles::zarr::utils::{
-    enumerate_data_variables, get_array_data_f64, get_spatial_dims, get_wkt_string, sample_data_var,
-};
+use crate::tiles::zarr::utils::{enumerate_data_variables, get_wkt_string, sample_data_var};
 use crate::tiles::{MartinCoreResult, Source, UrlQuery};
 use zarrs::filesystem::FilesystemStore;
 
@@ -37,7 +35,7 @@ pub struct ZarrSource {
 impl ZarrSource {
     /// Creates a new Zarr tile source from a file path
     pub fn new(id: String, path: PathBuf) -> Result<Self, ZarrError> {
-        let tileinfo = TileInfo::new(Format::Png, martin_tile_utils::Encoding::Uncompressed);
+        let tileinfo = TileInfo::new(Format::OctetStream, martin_tile_utils::Encoding::Zstd);
 
         let zarr_store = Arc::new(
             FilesystemStore::new(&path)
@@ -55,9 +53,6 @@ impl ZarrSource {
         for node_path in node_paths {
             let array = Array::open(zarr_store.clone(), node_path.as_str())
                 .map_err(|e| ZarrError::ArrayCreateError(e))?;
-
-            // calculate min and max values for normalization
-            let values = get_array_data_f64(&array)?;
             data_vars.insert(node_path.as_str().into(), array);
         }
         let wkt_str = get_wkt_string(zarr_store.clone())?;

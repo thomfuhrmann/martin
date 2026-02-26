@@ -117,7 +117,7 @@ postgres = [
 sprites = ["martin-core/sprites"]
 styles = ["martin-core/styles", "dep:walkdir"]
 webui = ["dep:actix-web-static-files", "dep:static-files", "dep:walkdir"]
-zarr = ["martin-core/zarr", "_tiles"]
+zarr = ["martin-core/zarr", "dep:zstd", "_tiles"]
 _tiles = ["martin-core/_tiles"]
 
 [dependencies]
@@ -168,6 +168,7 @@ tracing-subscriber = { workspace = true, default-features = false, features = [
 ] }
 url.workspace = true
 walkdir = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 
 [build-dependencies]
 static-files = { workspace = true, optional = true }

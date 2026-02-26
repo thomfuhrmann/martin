@@ -1,3 +1,5 @@
+use std::io::Cursor;
+
 use actix_http::ContentEncoding;
 use actix_http::header::Quality;
 use actix_web::error::{ErrorBadRequest, ErrorNotAcceptable, ErrorNotFound};
@@ -302,6 +304,10 @@ fn decode(tile: Tile) -> ActixResult<Tile> {
                 decode_brotli(&tile.data)?,
                 info.encoding(Encoding::Uncompressed),
             ),
+            Encoding::Zstd => Tile::new_hash_etag(
+                zstd::decode_all(Cursor::new(&tile.data))?,
+                info.encoding(Encoding::Uncompressed),
+            ),
             _ => Err(ErrorBadRequest(format!(
                 "Tile is is stored as {info}, but the client does not accept this encoding"
             )))?,
@@ -316,6 +322,7 @@ pub fn to_encoding(val: ContentEncoding) -> Option<Encoding> {
         ContentEncoding::Identity => Encoding::Uncompressed,
         ContentEncoding::Gzip => Encoding::Gzip,
         ContentEncoding::Brotli => Encoding::Brotli,
+        ContentEncoding::Zstd => Encoding::Zstd,
         // TODO: Deflate => Encoding::Zstd or Encoding::Zlib ?
         _ => None?,
     })

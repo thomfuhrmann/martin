@@ -46,6 +46,7 @@ base64 = "0.22.1"
 bit-set = "0.8"
 brotli = ">=5, <9"
 bytes = "1"
+bytemuck = "1.25.0"
 chrono = "0.4.43"
 clap = { version = "4", features = [
     "derive",
@@ -143,6 +144,7 @@ url = "2.5"
 walkdir = "2.5.0"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zarrs = "0.23.0"
+zstd = "0.13.3"
 
 [profile.dev.package]
 # See https://github.com/launchbadge/sqlx#compile-time-verification

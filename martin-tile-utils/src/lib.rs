@@ -81,6 +81,7 @@ pub enum Format {
     Png,
     Webp,
     Avif,
+    OctetStream,
 }
 
 impl Format {
@@ -95,6 +96,7 @@ impl Format {
             "png" => Self::Png,
             "webp" => Self::Webp,
             "avif" => Self::Avif,
+            "octet-stream" => Self::OctetStream,
             _ => None?,
         })
     }
@@ -112,12 +114,13 @@ impl Format {
             Self::Png => "png",
             Self::Webp => "webp",
             Self::Avif => "avif",
+            Self::OctetStream => "octet-stream",
         }
     }
 
     #[must_use]
     pub fn content_type(&self) -> &str {
-        match *self {
+        match self {
             Self::Gif => "image/gif",
             Self::Jpeg => "image/jpeg",
             Self::Json => "application/json",
@@ -126,6 +129,7 @@ impl Format {
             Self::Png => "image/png",
             Self::Webp => "image/webp",
             Self::Avif => "image/avif",
+            Self::OctetStream => "application/octet-stream",
         }
     }
 
@@ -138,7 +142,8 @@ impl Format {
             | Self::Webp
             | Self::Avif
             | Self::Json
-            | Self::Mlt => true,
+            | Self::Mlt
+            | Self::OctetStream => true,
             Self::Mvt => false,
         }
     }
@@ -146,7 +151,7 @@ impl Format {
 
 impl Display for Format {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match *self {
+        f.write_str(match self {
             Self::Gif => "gif",
             Self::Jpeg => "jpeg",
             Self::Json => "json",
@@ -155,6 +160,7 @@ impl Display for Format {
             Self::Png => "png",
             Self::Webp => "webp",
             Self::Avif => "avif",
+            Self::OctetStream => "octet-stream",
         })
     }
 }
@@ -290,7 +296,8 @@ impl From<Format> for TileInfo {
                 | Format::Jpeg
                 | Format::Webp
                 | Format::Gif
-                | Format::Avif => Encoding::Internal,
+                | Format::Avif
+                | Format::OctetStream => Encoding::Internal,
                 Format::Mvt | Format::Json => Encoding::Uncompressed,
             },
         )

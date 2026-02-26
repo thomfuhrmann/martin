@@ -42,6 +42,8 @@ zarr = [
     "dep:image",
     "dep:ndarray",
     "dep:chrono",
+    "dep:bytemuck",
+    "dep:zstd",
     "_tiles",
 ]
 fonts = [
@@ -73,6 +75,7 @@ actix-web = { workspace = true, optional = true }
 async-trait.workspace = true
 base64 = { workspace = true, optional = true }
 bit-set = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 deadpool-postgres = { workspace = true, optional = true }
@@ -107,6 +110,7 @@ tokio-postgres-rustls = { workspace = true, optional = true }
 tracing.workspace = true
 xxhash-rust.workspace = true
 zarrs = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 actix-web.workspace = true
