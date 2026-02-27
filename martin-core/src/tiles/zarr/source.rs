@@ -35,7 +35,10 @@ pub struct ZarrSource {
 impl ZarrSource {
     /// Creates a new Zarr tile source from a file path
     pub fn new(id: String, path: PathBuf) -> Result<Self, ZarrError> {
-        let tileinfo = TileInfo::new(Format::OctetStream, martin_tile_utils::Encoding::Zstd);
+        let tileinfo = TileInfo::new(
+            Format::OctetStream,
+            martin_tile_utils::Encoding::Uncompressed,
+        );
 
         let zarr_store = Arc::new(
             FilesystemStore::new(&path)

@@ -10,6 +10,7 @@ use actix_web::http::header::{
 use actix_web::web::{Data, Path, Query};
 use actix_web::{HttpMessage, HttpRequest, HttpResponse, Result as ActixResult, route};
 use futures::future::try_join_all;
+use futures::stream::TryConcat;
 use martin_core::tiles::{BoxedSource, OptTileCache, Tile, TileCache, UrlQuery};
 use martin_tile_utils::{
     Encoding, Format, TileCoord, TileData, TileInfo, decode_brotli, decode_gzip, encode_brotli,
@@ -288,6 +289,10 @@ fn encode(tile: Tile, enc: ContentEncoding) -> ActixResult<Tile> {
         ContentEncoding::Gzip => {
             Tile::new_hash_etag(encode_gzip(&tile.data)?, tile.info.encoding(Encoding::Gzip))
         }
+        ContentEncoding::Zstd => Tile::new_hash_etag(
+            zstd::encode_all(&tile.data[..], 3)?,
+            tile.info.encoding(Encoding::Zstd),
+        ),
         _ => tile,
     })
 }
