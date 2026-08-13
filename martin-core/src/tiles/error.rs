@@ -56,6 +56,11 @@ pub enum MartinCoreError {
     #[error(transparent)]
     GeoJsonError(#[from] super::geojson::GeoJsonError),
 
+    /// Errors that can occur during [`zarr`](crate::tiles::zarr) processing operations.
+    #[cfg(feature = "zarr")]
+    #[error(transparent)]
+    ZarrError(#[from] super::zarr::ZarrError),
+
     /// Errors occurring from other sources, not implemented by `martin-core`.
     #[error(transparent)]
     OtherError(#[from] Box<dyn std::error::Error + Send + Sync>),

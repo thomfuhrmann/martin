@@ -33,4 +33,10 @@ pub enum ZarrError {
     /// Zarr attribute error
     #[error("Zarr attribute error: {0}")]
     AttributeError(String),
+    /// Chrono parse error
+    #[error("Chrono parsing error: {0}")]
+    ParseError(chrono::ParseError),
+    /// Projection error
+    #[error("Projection error: {0}")]
+    ProjError(proj::ProjError),
 }
