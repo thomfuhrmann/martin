@@ -41,6 +41,24 @@ export function parsePrometheusMetrics(text: string): {
 }
 
 /**
+ * Finds the metric endpoint labels matching a group's route patterns.
+ *
+ * Labels carry the server's `route_prefix` (e.g. `/martin/{source_ids}/{z}/{x}/{y}`),
+ * while the patterns in `ENDPOINT_GROUPS` are unprefixed.
+ * Matching by suffix keeps the grouping correct regardless of the configured prefix.
+ * Patterns start with `/`, so the suffix always lands on a path-segment boundary.
+ */
+function matchingLabels(labels: Iterable<string>, patterns: readonly string[]): Set<string> {
+  const matched = new Set<string>();
+  for (const label of labels) {
+    if (patterns.some((pattern) => label === pattern || label.endsWith(pattern))) {
+      matched.add(label);
+    }
+  }
+  return matched;
+}
+
+/**
  * Aggregates endpoint metrics into logical groups and computes average duration and request count.
  *
  * @param sum - Record of endpoint to sum of durations
@@ -53,11 +71,12 @@ export function aggregateEndpointGroups(
   count: Record<string, number>,
   endpointGroups: Record<string, readonly string[]>,
 ): Record<string, { averageRequestDurationMs: number; requestCount: number }> {
+  const labels = new Set([...Object.keys(sum), ...Object.keys(count)]);
   const result: Record<string, { averageRequestDurationMs: number; requestCount: number }> = {};
   for (const [group, endpoints] of Object.entries(endpointGroups)) {
     let totalSum = 0;
     let totalCount = 0;
-    for (const endpoint of endpoints) {
+    for (const endpoint of matchingLabels(labels, endpoints)) {
       totalSum += sum[endpoint] || 0;
       totalCount += count[endpoint] || 0;
     }
@@ -142,23 +161,19 @@ export function aggregateHistogramGroups(
 ): Record<string, HistogramBucket[]> {
   const result: Record<string, HistogramBucket[]> = {};
 
+  const labels = Object.keys(histograms);
   for (const [group, endpoints] of Object.entries(endpointGroups)) {
-    for (const endpoint of endpoints) {
-      if (!result[group]) {
-        // due to etags, a multiple statuses are relevant.
-        // because they are not merged in previous steps, we have to do this here
-        // => short-circuiting by setting the result to the histogram would be incorrect
-        result[group] = [];
-      }
-      // Check if histogram data exists for this endpoint
-      if (histograms[endpoint]) {
-        for (const bucket of histograms[endpoint]) {
-          const existingBucket = result[group].find((b) => b.le === bucket.le);
-          if (existingBucket) {
-            existingBucket.count += bucket.count;
-          } else {
-            result[group].push(bucket);
-          }
+    // due to etags, multiple statuses are relevant.
+    // because they are not merged in previous steps, we have to do this here
+    // => short-circuiting by setting the result to the histogram would be incorrect
+    result[group] = [];
+    for (const endpoint of matchingLabels(labels, endpoints)) {
+      for (const bucket of histograms[endpoint]) {
+        const existingBucket = result[group].find((b) => b.le === bucket.le);
+        if (existingBucket) {
+          existingBucket.count += bucket.count;
+        } else {
+          result[group].push(bucket);
         }
       }
     }
@@ -170,6 +185,92 @@ export function aggregateHistogramGroups(
   }
 
   return result;
+}
+
+export interface HitCount {
+  hits: number;
+  misses: number;
+}
+
+export interface ZoomHitCount extends HitCount {
+  zoom: number;
+}
+
+/**
+ * Per-cache hit/miss aggregate plus an optional per-zoom breakdown.
+ *
+ * `byZoom` is empty for caches without a zoom dimension (`sprite`, `font`).
+ * Consumers should treat `[]` as not-applicable, not as no-data.
+ */
+export interface CacheMetrics extends HitCount {
+  byZoom: ZoomHitCount[];
+}
+
+export interface EndpointAnalytics {
+  averageRequestDurationMs: number;
+  requestCount: number;
+  histogram: HistogramBucket[];
+}
+
+export interface AnalyticsData {
+  sprites: EndpointAnalytics;
+  tiles: EndpointAnalytics;
+  fonts: EndpointAnalytics;
+  styles: EndpointAnalytics;
+  caches: Record<string, CacheMetrics>;
+}
+
+/** `null` when no requests have been recorded; otherwise a value in `[0, 1]`. */
+export function hitRate({ hits, misses }: HitCount): number | null {
+  const total = hits + misses;
+  return total > 0 ? hits / total : null;
+}
+
+const CACHE_LINE_RE = /^martin_(?:tile_)?cache_requests_total\{(.*)\}\s+([0-9.eE+-]+)$/;
+
+export function parseCacheMetrics(text: string): Record<string, CacheMetrics> {
+  const buckets: Record<string, Record<string, HitCount>> = {};
+
+  for (const line of text.split('\n')) {
+    const match = line.trim().match(CACHE_LINE_RE);
+    if (!match) continue;
+
+    const labels = match[1];
+    const value = parseFloat(match[2]);
+    if (!Number.isFinite(value)) continue;
+
+    const cache = /cache="([^"]+)"/.exec(labels)?.[1];
+    const result = /result="([^"]+)"/.exec(labels)?.[1];
+    if (!cache || (result !== 'hit' && result !== 'miss')) continue;
+    const zoom = /zoom="([^"]*)"/.exec(labels)?.[1] ?? '';
+
+    if (!buckets[cache]) buckets[cache] = {};
+    const perCache = buckets[cache];
+    if (!perCache[zoom]) perCache[zoom] = { hits: 0, misses: 0 };
+    if (result === 'hit') {
+      perCache[zoom].hits += value;
+    } else {
+      perCache[zoom].misses += value;
+    }
+  }
+
+  const out: Record<string, CacheMetrics> = {};
+  for (const [cache, perZoom] of Object.entries(buckets)) {
+    let hits = 0;
+    let misses = 0;
+    const byZoom: ZoomHitCount[] = [];
+    for (const [zoomStr, counts] of Object.entries(perZoom)) {
+      hits += counts.hits;
+      misses += counts.misses;
+      const zoomNum = Number(zoomStr);
+      if (zoomStr !== '' && Number.isFinite(zoomNum)) {
+        byZoom.push({ ...counts, zoom: zoomNum });
+      }
+    }
+    byZoom.sort((a, b) => a.zoom - b.zoom);
+    out[cache] = { byZoom, hits, misses };
+  }
+  return out;
 }
 
 export const ENDPOINT_GROUPS = {

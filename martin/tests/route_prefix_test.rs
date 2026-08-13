@@ -1,5 +1,6 @@
 #![cfg(feature = "mbtiles")]
 
+use actix_web::http::header::LOCATION;
 use actix_web::test::{TestRequest, call_service, read_body, read_body_json};
 use indoc::formatdoc;
 use martin::config::file::srv::SrvConfig;
@@ -11,16 +12,17 @@ pub use utils::*;
 
 macro_rules! create_app_with_prefix {
     ($sources:expr, $srv_config:expr) => {{
-        let state = mock_sources(mock_cfg($sources)).await.0;
+        let state = mock_sources(mock_cfg($sources).await).await.0;
         ::actix_web::test::init_service(
             ::actix_web::App::new()
                 .app_data(actix_web::web::Data::new(
-                    ::martin::srv::Catalog::new(&state).unwrap(),
+                    ::martin::srv::Catalog::new(
+                        #[cfg(any(feature = "sprites", feature = "fonts", feature = "styles"))]
+                        &state,
+                    )
+                    .unwrap(),
                 ))
-                .app_data(actix_web::web::Data::new(
-                    ::martin_core::tiles::NO_TILE_CACHE,
-                ))
-                .app_data(actix_web::web::Data::new(state.tiles))
+                .app_data(actix_web::web::Data::new(state.tile_manager))
                 .app_data(actix_web::web::Data::new($srv_config.clone()))
                 .configure(|c| ::martin::srv::router(c, &$srv_config)),
         )
@@ -64,10 +66,10 @@ async fn config(
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_route_prefix_basic_endpoints() {
+async fn route_prefix_basic_endpoints() {
     let (config, _conns) = config("test_route_prefix_basic").await;
     let srv_config = SrvConfig {
-        route_prefix: Some("/tiles".to_string()),
+        route_prefix: Some("/tiles".to_owned()),
         ..Default::default()
     };
     let app = create_app_with_prefix!(&config, srv_config);
@@ -79,10 +81,12 @@ async fn test_route_prefix_basic_endpoints() {
     let body = read_body(response).await;
     assert_eq!(body, "OK");
 
-    // Health without prefix should fail
+    // Health without prefix should still work
     let req = test_get("/health").to_request();
     let response = call_service(&app, req).await;
-    assert_eq!(response.status(), 404);
+    let response = assert_response(response).await;
+    let body = read_body(response).await;
+    assert_eq!(body, "OK");
 
     // Test catalog endpoint
     let req = test_get("/tiles/catalog").to_request();
@@ -100,10 +104,10 @@ async fn test_route_prefix_basic_endpoints() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_route_prefix_tile_endpoints() {
+async fn route_prefix_tile_endpoints() {
     let (config, _conns) = config("test_route_prefix_tiles").await;
     let srv_config = SrvConfig {
-        route_prefix: Some("/tiles".to_string()),
+        route_prefix: Some("/tiles".to_owned()),
         ..Default::default()
     };
     let app = create_app_with_prefix!(&config, srv_config);
@@ -141,11 +145,35 @@ async fn test_route_prefix_tile_endpoints() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_base_path_overrides_route_prefix() {
+async fn route_prefix_pbf_redirect_location() {
+    let (config, _conns) = config("test_route_prefix_pbf_redirect").await;
+    let srv_config = SrvConfig {
+        route_prefix: Some("/geotile".to_owned()),
+        ..Default::default()
+    };
+    let app = create_app_with_prefix!(&config, srv_config);
+
+    let req = test_get("/geotile/m_mvt/0/0/0.pbf?foo=bar").to_request();
+    let response = call_service(&app, req).await;
+    assert_eq!(response.status(), 301);
+
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .expect("Location header should be set")
+        .to_str()
+        .expect("Location header should be valid UTF-8");
+
+    assert_eq!(location, "/geotile/m_mvt/0/0/0?foo=bar");
+}
+
+#[actix_rt::test]
+#[tracing_test::traced_test]
+async fn base_path_overrides_route_prefix() {
     let (config, _conns) = config("test_base_path_override").await;
     let srv_config = SrvConfig {
-        route_prefix: Some("/tiles".to_string()),
-        base_path: Some("/custom".to_string()),
+        route_prefix: Some("/tiles".to_owned()),
+        base_path: Some("/custom".to_owned()),
         ..Default::default()
     };
     let app = create_app_with_prefix!(&config, srv_config);
@@ -167,10 +195,10 @@ async fn test_base_path_overrides_route_prefix() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_nested_route_prefix() {
+async fn nested_route_prefix() {
     let (config, _conns) = config("test_nested_prefix").await;
     let srv_config = SrvConfig {
-        route_prefix: Some("/api/v1/tiles".to_string()),
+        route_prefix: Some("/api/v1/tiles".to_owned()),
         ..Default::default()
     };
     let app = create_app_with_prefix!(&config, srv_config);
@@ -203,7 +231,7 @@ async fn test_nested_route_prefix() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_route_prefix_root_path() {
+async fn route_prefix_root_path() {
     let (config, _conns) = config("test_root_path").await;
     // Setting route_prefix to "/" should be treated as no prefix after normalization
     let srv_config = SrvConfig {

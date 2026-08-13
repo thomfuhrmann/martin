@@ -11,7 +11,7 @@ pub use utils::*;
 
 macro_rules! create_app {
     ($sources:expr) => {{
-        let cfg = mock_cfg($sources);
+        let cfg = mock_cfg($sources).await;
         let state = mock_sources(cfg.clone()).await.0;
         let srv_config = cfg.srv;
         let cors_middleware = srv_config
@@ -23,12 +23,13 @@ macro_rules! create_app {
         ::actix_web::test::init_service(
             ::actix_web::App::new()
                 .app_data(actix_web::web::Data::new(
-                    ::martin::srv::Catalog::new(&state).unwrap(),
+                    ::martin::srv::Catalog::new(
+                        #[cfg(any(feature = "sprites", feature = "fonts", feature = "styles"))]
+                        &state,
+                    )
+                    .unwrap(),
                 ))
-                .app_data(actix_web::web::Data::new(
-                    ::martin_core::tiles::NO_TILE_CACHE,
-                ))
-                .app_data(actix_web::web::Data::new(state.tiles))
+                .app_data(actix_web::web::Data::new(state.tile_manager))
                 .app_data(actix_web::web::Data::new(srv_config.clone()))
                 .wrap(actix_web::middleware::Condition::new(
                     cors_middleware.is_some(),
@@ -42,7 +43,7 @@ macro_rules! create_app {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_cors_explicit_disabled() {
+async fn cors_explicit_disabled() {
     let script = include_str!("../../tests/fixtures/mbtiles/world_cities.sql");
     let (_mbt, _conn, file) = temp_named_mbtiles("test_cors_explicit_disabled", script).await;
 
@@ -68,7 +69,7 @@ async fn test_cors_explicit_disabled() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_cors_implicit_enabled() {
+async fn cors_implicit_enabled() {
     let script = include_str!("../../tests/fixtures/mbtiles/world_cities.sql");
     let (_mbt, _conn, file) = temp_named_mbtiles("test_cors_implicit_enabled", script).await;
 
@@ -92,7 +93,7 @@ async fn test_cors_implicit_enabled() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_cors_explicit_enabled() {
+async fn cors_explicit_enabled() {
     let script = include_str!("../../tests/fixtures/mbtiles/world_cities.sql");
     let (_mbt, _conn, file) = temp_named_mbtiles("test_cors_explicit_enabled", script).await;
 
@@ -117,7 +118,7 @@ async fn test_cors_explicit_enabled() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_cors_specific_origin() {
+async fn cors_specific_origin() {
     let script = include_str!("../../tests/fixtures/mbtiles/world_cities.sql");
     let (_mbt, _conn, file) = temp_named_mbtiles("test_cors_specific_origin", script).await;
 
@@ -143,7 +144,7 @@ async fn test_cors_specific_origin() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_cors_no_header_on_mismatch() {
+async fn cors_no_header_on_mismatch() {
     let script = include_str!("../../tests/fixtures/mbtiles/world_cities.sql");
     let (_mbt, _conn, file) = temp_named_mbtiles("test_cors_no_header_on_mismatch", script).await;
 
@@ -171,7 +172,7 @@ async fn test_cors_no_header_on_mismatch() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_cors_preflight_request_with_max_age() {
+async fn cors_preflight_request_with_max_age() {
     let script = include_str!("../../tests/fixtures/mbtiles/world_cities.sql");
     let (_mbt, _conn, file) =
         temp_named_mbtiles("test_cors_preflight_request_with_max_age", script).await;
@@ -206,7 +207,7 @@ async fn test_cors_preflight_request_with_max_age() {
 
 #[actix_rt::test]
 #[tracing_test::traced_test]
-async fn test_cors_preflight_request_without_max_age() {
+async fn cors_preflight_request_without_max_age() {
     let script = include_str!("../../tests/fixtures/mbtiles/world_cities.sql");
     let (_mbt, _conn, file) =
         temp_named_mbtiles("test_cors_preflight_request_without_max_age", script).await;

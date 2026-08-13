@@ -1,0 +1,394 @@
+use std::num::NonZeroUsize;
+
+use serde::{Deserialize, Serialize};
+
+use crate::config::args::BoundsCalcType;
+use crate::config::file::tiles::duckdb::sources::{
+    DuckDbDatabaseEntry, DuckDbSourceDefaults, GeoParquetEntry,
+};
+use crate::config::file::{
+    CollectUnrecognizedKeys, ConfigFileResult, ConfigurationLivecycleHooks, UnrecognizedValues,
+};
+
+const DEFAULT_POOL_SIZE: usize = 4;
+
+fn default_pool_size() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_POOL_SIZE).expect("default pool size must be non-zero")
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires `&T`"
+)]
+fn is_default_pool_size(v: &NonZeroUsize) -> bool {
+    v.get() == DEFAULT_POOL_SIZE
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires `&T`"
+)]
+fn is_default_auto_bounds(v: &BoundsCalcType) -> bool {
+    *v == BoundsCalcType::default()
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, CollectUnrecognizedKeys)]
+#[cfg_attr(feature = "unstable-schemas", derive(schemars::JsonSchema))]
+pub struct DuckDbConfig {
+    /// Connection pool size used by `DuckDB` sources unless overridden per-source.
+    #[serde(
+        default = "default_pool_size",
+        skip_serializing_if = "is_default_pool_size"
+    )]
+    pub pool_size: NonZeroUsize,
+    /// Optional `DuckDB` execution thread count for each connection.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional `DuckDB` memory limit in megabytes for each connection.
+    pub memory_limit_mb: Option<NonZeroUsize>,
+    /// Bounds behavior for auto-generated `TileJSON` bounds.
+    #[serde(default, skip_serializing_if = "is_default_auto_bounds")]
+    pub auto_bounds: BoundsCalcType,
+    /// Ordered source definitions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<DuckDbSourceEntry>,
+    #[serde(flatten, skip_serializing)]
+    #[cfg_attr(feature = "unstable-schemas", schemars(skip))]
+    pub unrecognized: UnrecognizedValues,
+}
+
+impl Default for DuckDbConfig {
+    fn default() -> Self {
+        Self {
+            pool_size: default_pool_size(),
+            threads: None,
+            memory_limit_mb: None,
+            auto_bounds: BoundsCalcType::default(),
+            sources: Vec::new(),
+            unrecognized: UnrecognizedValues::default(),
+        }
+    }
+}
+
+impl DuckDbConfig {
+    /// Returns `true` when no sources are configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+}
+
+impl ConfigurationLivecycleHooks for DuckDbConfig {
+    async fn finalize(&mut self) -> ConfigFileResult<()> {
+        let defaults = DuckDbSourceDefaults {
+            pool_size: self.pool_size,
+            threads: self.threads,
+            memory_limit_mb: self.memory_limit_mb,
+            auto_bounds: self.auto_bounds,
+        };
+
+        for source in &mut self.sources {
+            source.finalize()?;
+            source.apply_defaults(defaults);
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, CollectUnrecognizedKeys)]
+#[serde(untagged)]
+pub enum DuckDbSourceEntry {
+    Database(DuckDbDatabaseEntry),
+    GeoParquet(GeoParquetEntry),
+}
+
+impl DuckDbSourceEntry {
+    pub(crate) fn finalize(&mut self) -> ConfigFileResult<()> {
+        match self {
+            Self::Database(v) => {
+                v.finalize();
+                Ok(())
+            }
+            Self::GeoParquet(v) => v.finalize(),
+        }
+    }
+
+    pub(crate) fn apply_defaults(&mut self, defaults: DuckDbSourceDefaults) {
+        match self {
+            Self::Database(v) => v.settings.apply_defaults(defaults),
+            Self::GeoParquet(v) => v.settings.apply_defaults(defaults),
+        }
+    }
+}
+
+#[cfg(feature = "unstable-schemas")]
+impl schemars::JsonSchema for DuckDbSourceEntry {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DuckDbSourceEntry".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let database = generator.subschema_for::<DuckDbDatabaseEntry>();
+        let geoparquet = generator.subschema_for::<GeoParquetEntry>();
+        schemars::json_schema!({
+            "description": "DuckDB source entry: exactly one of `database` or `geoparquet` must be present.",
+            "oneOf": [
+                database,
+                geoparquet,
+            ]
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::file::tiles::duckdb::GeoParquetLocation;
+
+    const GEOPARQUET_FIXTURE: &str = "../tests/fixtures/duckdb/geoparquet_polygons.parquet";
+
+    #[test]
+    fn source_list_may_mix_database_and_geoparquet() {
+        let yaml = r"
+pool_size: 4
+auto_bounds: quick
+sources:
+  - database: /data/tiles.duckdb
+    auto_publish:
+      tables:
+        from_schemas: autodetect
+  - geoparquet: /data/buildings.parquet
+    layer_id: buildings
+    geometry_column: geom
+    srid: 4326
+    minzoom: 0
+    maxzoom: 14
+    extent: 4096
+    buffer: 64
+";
+        let cfg: DuckDbConfig = serde_saphyr::from_str(yaml).expect("duckdb config");
+
+        insta::assert_debug_snapshot!(cfg, @r#"
+        DuckDbConfig {
+            pool_size: 4,
+            threads: None,
+            memory_limit_mb: None,
+            auto_bounds: Quick,
+            sources: [
+                Database(
+                    DuckDbDatabaseEntry {
+                        database: "/data/tiles.duckdb",
+                        settings: DuckDbSourceSettings {
+                            pool_size: None,
+                            threads: None,
+                            memory_limit_mb: None,
+                            auto_bounds: None,
+                        },
+                        auto_publish: Some(
+                            Object {
+                                "tables": Object {
+                                    "from_schemas": String("autodetect"),
+                                },
+                            },
+                        ),
+                        tables: None,
+                        macros: None,
+                        unrecognized: UnrecognizedValues(
+                            {},
+                        ),
+                    },
+                ),
+                GeoParquet(
+                    GeoParquetEntry {
+                        geoparquet: "/data/buildings.parquet",
+                        location: None,
+                        layer_id: Some(
+                            "buildings",
+                        ),
+                        id_column: None,
+                        geometry_column: Some(
+                            "geom",
+                        ),
+                        srid: Some(
+                            4326,
+                        ),
+                        minzoom: Some(
+                            0,
+                        ),
+                        maxzoom: Some(
+                            14,
+                        ),
+                        extent: Some(
+                            4096,
+                        ),
+                        buffer: Some(
+                            64,
+                        ),
+                        clip_geom: None,
+                        settings: DuckDbSourceSettings {
+                            pool_size: None,
+                            threads: None,
+                            memory_limit_mb: None,
+                            auto_bounds: None,
+                        },
+                        unrecognized: UnrecognizedValues(
+                            {},
+                        ),
+                    },
+                ),
+            ],
+            unrecognized: UnrecognizedValues(
+                {},
+            ),
+        }
+        "#);
+    }
+
+    #[tokio::test]
+    async fn source_overrides_from_yaml_take_precedence_over_top_level() {
+        let yaml = indoc::formatdoc! {"
+            pool_size: 8
+            threads: 2
+            memory_limit_mb: 1024
+            auto_bounds: quick
+            sources:
+              - geoparquet: {GEOPARQUET_FIXTURE}
+                pool_size: 3
+                memory_limit_mb: 256
+                auto_bounds: skip
+        "};
+        let mut cfg: DuckDbConfig = serde_saphyr::from_str(&yaml).expect("duckdb config");
+        cfg.finalize().await.expect("finalize duckdb config");
+
+        assert_eq!(cfg.pool_size.get(), 8);
+        assert_eq!(cfg.threads.map(NonZeroUsize::get), Some(2));
+        assert_eq!(cfg.memory_limit_mb.map(NonZeroUsize::get), Some(1024));
+
+        let DuckDbSourceEntry::GeoParquet(entry) = &cfg.sources[0] else {
+            panic!("expected geoparquet entry");
+        };
+        assert_eq!(entry.geoparquet, GEOPARQUET_FIXTURE);
+        assert!(matches!(entry.location, Some(GeoParquetLocation::Local(_))));
+        insta::assert_debug_snapshot!(entry.settings, @r#"
+        DuckDbSourceSettings {
+            pool_size: Some(
+                3,
+            ),
+            threads: Some(
+                2,
+            ),
+            memory_limit_mb: Some(
+                256,
+            ),
+            auto_bounds: Some(
+                Skip,
+            ),
+        }
+        "#);
+    }
+
+    #[test]
+    fn source_entry_with_both_keys_deserializes_as_database() {
+        let yaml = r"
+sources:
+  - database: /data/tiles.duckdb
+    geoparquet: /data/buildings.parquet
+";
+        let cfg: DuckDbConfig = serde_saphyr::from_str(yaml).expect("duckdb config");
+
+        insta::assert_debug_snapshot!(cfg, @r#"
+        DuckDbConfig {
+            pool_size: 4,
+            threads: None,
+            memory_limit_mb: None,
+            auto_bounds: Quick,
+            sources: [
+                Database(
+                    DuckDbDatabaseEntry {
+                        database: "/data/tiles.duckdb",
+                        settings: DuckDbSourceSettings {
+                            pool_size: None,
+                            threads: None,
+                            memory_limit_mb: None,
+                            auto_bounds: None,
+                        },
+                        auto_publish: None,
+                        tables: None,
+                        macros: None,
+                        unrecognized: UnrecognizedValues(
+                            {
+                                "geoparquet": String("/data/buildings.parquet"),
+                            },
+                        ),
+                    },
+                ),
+            ],
+            unrecognized: UnrecognizedValues(
+                {},
+            ),
+        }
+        "#);
+    }
+
+    #[test]
+    fn source_entry_rejects_missing_database_and_geoparquet() {
+        let yaml = r"
+sources:
+  - layer_id: buildings
+    srid: 4326
+";
+        let err = serde_saphyr::from_str::<DuckDbConfig>(yaml).expect_err("missing entry keys");
+        assert!(
+            err.to_string()
+                .contains("data did not match any variant of untagged enum DuckDbSourceEntry")
+        );
+    }
+
+    #[tokio::test]
+    async fn top_level_config_finalizes_defaults_and_serializes() {
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        use crate::config::file::{Config, parse_config};
+
+        let yaml = indoc::formatdoc! {"
+            duckdb:
+              pool_size: 8
+              threads: 2
+              memory_limit_mb: 1024
+              sources:
+                - geoparquet: {GEOPARQUET_FIXTURE}
+                  layer_id: buildings
+                - geoparquet: {GEOPARQUET_FIXTURE}
+                  pool_size: 3
+                  memory_limit_mb: 256
+                  auto_bounds: skip
+        "};
+        let mut config: Config =
+            parse_config(&yaml, &HashMap::new(), Path::new("<test>")).expect("parse config");
+        config.finalize().await.expect("finalize");
+
+        insta::assert_snapshot!(
+            serde_saphyr::to_string(&config).expect("serialize config"),
+            @r#"
+        duckdb:
+          pool_size: 8
+          threads: 2
+          memory_limit_mb: 1024
+          sources:
+          - geoparquet: ../tests/fixtures/duckdb/geoparquet_polygons.parquet
+            layer_id: buildings
+            pool_size: 8
+            threads: 2
+            memory_limit_mb: 1024
+            auto_bounds: quick
+          - geoparquet: ../tests/fixtures/duckdb/geoparquet_polygons.parquet
+            pool_size: 3
+            threads: 2
+            memory_limit_mb: 256
+            auto_bounds: skip
+        "#
+        );
+    }
+}

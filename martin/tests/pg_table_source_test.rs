@@ -1,4 +1,4 @@
-#![cfg(feature = "postgres")]
+#![cfg(feature = "test-pg")]
 
 use indoc::indoc;
 use insta::assert_yaml_snapshot;
@@ -8,9 +8,9 @@ pub use utils::*;
 
 #[actix_rt::test]
 async fn table_source() {
-    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL")).await;
+    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL").await).await;
     insta::with_settings!({sort_maps => true}, {
-    assert_yaml_snapshot!(mock.0.tiles.get_catalog(), @r#"
+    assert_yaml_snapshot!(mock.0.tile_manager.tile_sources().get_catalog(), @r#"
     "-function.withweired---_-characters":
       content_type: application/x-protobuf
       description: a function source with special characters
@@ -29,6 +29,9 @@ async fn table_source() {
     bigint_table:
       content_type: application/x-protobuf
       description: autodetect.bigint_table.geom
+    empty_bounds:
+      content_type: application/x-protobuf
+      description: public.empty_bounds.geom
     function_Mixed_Name:
       content_type: application/x-protobuf
       description: a function source with MixedCase name
@@ -58,12 +61,24 @@ async fn table_source() {
     function_zxy_query_test:
       content_type: application/x-protobuf
       description: public.function_zxy_query_test
+    function_zxy_raster:
+      content_type: image/png
+      description: a raster tile function source
     function_zxy_row:
       content_type: application/x-protobuf
       description: public.function_zxy_row
     function_zxy_row_key:
       content_type: application/x-protobuf
       description: public.function_zxy_row_key
+    linestring_bounds:
+      content_type: application/x-protobuf
+      description: public.linestring_bounds.geom
+    linestring_bounds_vertical:
+      content_type: application/x-protobuf
+      description: public.linestring_bounds_vertical.geom
+    point_bounds:
+      content_type: application/x-protobuf
+      description: public.point_bounds.geom
     points1:
       content_type: application/x-protobuf
       description: public.points1.geom
@@ -135,16 +150,16 @@ async fn table_source() {
     ");
 
     let source3 = table(&mock, "points3857");
-    assert_yaml_snapshot!(source3, @r"
+    assert_yaml_snapshot!(source3, @"
     schema: public
     table: points3857
     srid: 3857
     geometry_column: geom
     bounds:
-      - -161.40590777554058
-      - -81.50727021609012
-      - 172.51549126768532
-      - 84.2440187164111
+      - -161.4059125851273
+      - -81.50727080755011
+      - 172.51550346797322
+      - 84.24401966908702
     geometry_type: POINT
     properties:
       gid: int4
@@ -153,7 +168,7 @@ async fn table_source() {
 
 #[actix_rt::test]
 async fn tables_tilejson() {
-    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL")).await;
+    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL").await).await;
     let src = source(&mock, "table_source");
     assert_yaml_snapshot!(src.get_tilejson(), @r"
     tilejson: 3.0.0
@@ -175,7 +190,7 @@ async fn tables_tilejson() {
 
 #[actix_rt::test]
 async fn tables_tile_ok() {
-    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL")).await;
+    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL").await).await;
     let tile = source(&mock, "table_source")
         .get_tile(TileCoord { z: 0, x: 0, y: 0 }, None)
         .await
@@ -186,10 +201,13 @@ async fn tables_tile_ok() {
 
 #[actix_rt::test]
 async fn tables_srid_ok() {
-    let mock = mock_sources(mock_pgcfg(indoc! {"
+    let mock = mock_sources(
+        mock_pgcfg(indoc! {"
         connection_string: $DATABASE_URL
         default_srid: 900913
-    "}))
+    "})
+        .await,
+    )
     .await;
 
     let source = table(&mock, "points1");
@@ -207,7 +225,7 @@ async fn tables_srid_ok() {
 
 #[actix_rt::test]
 async fn tables_multiple_geom_ok() {
-    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL")).await;
+    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL").await).await;
 
     let source = table(&mock, "table_source_multiple_geom");
     assert_eq!(source.geometry_column, "geom1");
@@ -224,11 +242,87 @@ async fn table_source_schemas() {
           tables:
             from_schemas: MixedCase
           functions: false
-    "});
+    "})
+    .await;
     let sources = mock_sources(cfg).await.0;
-    assert_yaml_snapshot!(sources.tiles.get_catalog(), @r"
+    assert_yaml_snapshot!(sources.tile_manager.tile_sources().get_catalog(), @r"
     MixPoints:
       content_type: application/x-protobuf
       description: a description from comment on table
+    ");
+}
+
+#[actix_rt::test]
+async fn table_bounds_linestring_horizontal_ok() {
+    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL").await).await;
+    let source = table(&mock, "linestring_bounds");
+    assert_yaml_snapshot!(source, @"
+    schema: public
+    table: linestring_bounds
+    srid: 4326
+    geometry_column: geom
+    bounds:
+      - 9.958169937133789
+      - 10.037016868591309
+      - 9.967533111572266
+      - 10.037017822265625
+    geometry_type: GEOMETRY
+    properties:
+      gid: int4
+    ");
+}
+
+#[actix_rt::test]
+async fn table_bounds_linestring_vertical_ok() {
+    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL").await).await;
+    let source = table(&mock, "linestring_bounds_vertical");
+    assert_yaml_snapshot!(source, @"
+    schema: public
+    table: linestring_bounds_vertical
+    srid: 4326
+    geometry_column: geom
+    bounds:
+      - 9
+      - 8.958169937133789
+      - 11
+      - 10.967533111572266
+    geometry_type: GEOMETRY
+    properties:
+      gid: int4
+    ");
+}
+
+#[actix_rt::test]
+async fn table_bounds_single_point_ok() {
+    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL").await).await;
+    let source = table(&mock, "point_bounds");
+    assert_yaml_snapshot!(source, @r"
+    schema: public
+    table: point_bounds
+    srid: 4326
+    geometry_column: geom
+    bounds:
+      - 9
+      - 19
+      - 11
+      - 21
+    geometry_type: GEOMETRY
+    properties:
+      gid: int4
+    ");
+}
+
+#[actix_rt::test]
+async fn table_bounds_empty_table_ok() {
+    let mock = mock_sources(mock_pgcfg("connection_string: $DATABASE_URL").await).await;
+    let source = table(&mock, "empty_bounds");
+    assert_yaml_snapshot!(source, @r"
+    schema: public
+    table: empty_bounds
+    srid: 4326
+    geometry_column: geom
+    geometry_type: GEOMETRY
+    properties:
+      gid: int4
     ");
 }

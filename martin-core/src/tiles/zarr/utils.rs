@@ -510,6 +510,38 @@ fn find_closest_binary(
     }
 }
 
+// TODO: move blocking CPU bound coord transformation to thread pool
+
+use std::sync::{Arc, LazyLock};
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use tokio::sync::oneshot;
+
+// Thread pool initializes automatically on first dereference
+static REPROJECT_POOL: LazyLock<Arc<ThreadPool>> = LazyLock::new(|| {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(reproject_worker_count())
+        .thread_name(|i| format!("lazycogs-reproject-{}", i))
+        .build()
+        .expect("failed to create reproject thread pool");
+    Arc::new(pool)
+});
+
+pub async fn run_reproject<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+
+    // Accessing &*REPROJECT_POOL triggers the lazy initialization on first call
+    REPROJECT_POOL.spawn(move || {
+        let res = f();
+        let _ = tx.send(res);
+    });
+
+    rx.await.expect("worker thread panicked or dropped")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

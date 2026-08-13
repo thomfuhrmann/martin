@@ -15,11 +15,13 @@ demo/
 #### This must match .gitignore ####
 ####
 
+**/*.pending-snap
 **/*.rs.bk
 **/dist/
 **/node_modules/
 *.mbtiles
 *.profraw
+.claude
 .DS_Store
 .aider*
 .aws-sam/
@@ -32,7 +34,6 @@ coverage
 pg_data/
 target/
 test_log*
-tests/mbtiles_temp_files/
 tests/output/
 tmp/
 tsconfig.tsbuildinfo

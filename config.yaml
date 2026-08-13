@@ -1,0 +1,37 @@
+---
+keep_alive: 75
+
+# The socket address to bind [default: 0.0.0.0:3000]
+listen_addresses: '0.0.0.0:3000'
+
+# Number of web server workers
+worker_processes: 8
+
+# Amount of memory (in MB) to use for caching tiles [default: 512, 0 to disable]
+cache_size_mb: 512
+
+# CORS Configuration
+#
+# Defaults to `cors: true`, which allows all origins.
+# Sending/Acting on CORS headers can be completely disabled via `cors: false`
+cors:
+  # Sets the `Access-Control-Allow-Origin` header [default: *]
+  # '*' will use the requests `ORIGIN` header
+  origin:
+    - '*'
+  # Sets `Access-Control-Max-Age` Header. [default: null]
+  # null means not setting the header for preflight requests
+  max_age: null
+
+#pmtiles:
+#  sources:
+#    gu_keys: "C:/Users/fuhtho/Daten/GU_Keys/gu_keys.pmtiles"
+
+mbtiles:
+  sources:
+    gu_keys: "C:/Users/fuhtho/Daten/GU_Keys/gu_keys.mbtiles"
+
+cog:
+  sources:
+      gk50: "C:/Users/fuhtho/Daten/GK50_Kartenfelder_EPSG3857/cog/mosaic_cog.tif"
+      geofast: "C:/Users/fuhtho/Daten/GEOFAST_Kartenfelder_EPSG3857/cog/mosaic_cog.tif"

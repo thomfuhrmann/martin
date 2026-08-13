@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   aggregateEndpointGroups,
   aggregateHistogramGroups,
+  hitRate,
+  parseCacheMetrics,
   parseCompletePrometheusMetrics,
   parsePrometheusHistogram,
   parsePrometheusMetrics,
@@ -115,6 +117,40 @@ describe('parsePrometheusMetrics', () => {
       expect(result.group1.requestCount).toBe(0);
       expect(result.group2.averageRequestDurationMs).toBe(0);
       expect(result.group2.requestCount).toBe(0);
+    });
+
+    it('matches endpoints carrying a route_prefix', () => {
+      // With `route_prefix = /martin`, actix labels endpoints with the prefix,
+      // but ENDPOINT_GROUPS patterns are unprefixed.
+      const sum = {
+        '/martin/{source_ids}': 2,
+        '/martin/{source_ids}/{z}/{x}/{y}': 10,
+      };
+      const count = {
+        '/martin/{source_ids}': 4,
+        '/martin/{source_ids}/{z}/{x}/{y}': 20,
+      };
+      const endpointGroups = {
+        tiles: ['/{source_ids}/{z}/{x}/{y}', '/{source_ids}'],
+      };
+
+      const result = aggregateEndpointGroups(sum, count, endpointGroups);
+
+      // sum = 10+2 = 12, count = 20+4 = 24, avg = (12/24)*1000 = 500
+      expect(result.tiles.requestCount).toBe(24);
+      expect(result.tiles.averageRequestDurationMs).toBeCloseTo(500);
+    });
+
+    it('does not let a shorter pattern double-count a longer endpoint', () => {
+      // `/{source_ids}` must not also match `/martin/{source_ids}/{z}/{x}/{y}`.
+      const sum = { '/martin/{source_ids}/{z}/{x}/{y}': 10 };
+      const count = { '/martin/{source_ids}/{z}/{x}/{y}': 20 };
+      const endpointGroups = {
+        tiles: ['/{source_ids}/{z}/{x}/{y}', '/{source_ids}'],
+      };
+
+      const result = aggregateEndpointGroups(sum, count, endpointGroups);
+      expect(result.tiles.requestCount).toBe(20);
     });
   });
 
@@ -346,6 +382,25 @@ describe('parsePrometheusMetrics', () => {
         expect(result.tiles).toHaveLength(0);
       });
 
+      it('matches prefixed endpoint labels against unprefixed patterns', () => {
+        const histograms = {
+          '/martin/{source_ids}/{z}/{x}/{y}': [
+            { count: 1000, le: 0.005 },
+            { count: 1200, le: 0.01 },
+          ],
+        };
+
+        const endpointGroups = {
+          tiles: ['/{source_ids}/{z}/{x}/{y}', '/{source_ids}'],
+        };
+
+        const result = aggregateHistogramGroups(histograms, endpointGroups);
+
+        expect(result.tiles).toHaveLength(2);
+        expect(result.tiles[0]).toEqual({ count: 1000, le: 0.005 });
+        expect(result.tiles[1]).toEqual({ count: 1200, le: 0.01 });
+      });
+
       it('handles partial histogram data (some endpoints missing)', () => {
         const histograms = {
           '/sprite/{source_ids}.json': [{ count: 100, le: 0.01 }],
@@ -433,5 +488,114 @@ describe('parsePrometheusMetrics', () => {
       expect(aggregatedMetrics.sprites.requestCount).toBe(350);
       expect(aggregatedMetrics.sprites.averageRequestDurationMs).toBeCloseTo(10); // (3.5/350)*1000
     });
+  });
+});
+
+describe('parseCacheMetrics', () => {
+  it('parses zoom-less caches from martin_cache_requests_total', () => {
+    const text = [
+      '# HELP martin_cache_requests_total Martin cache lookups',
+      '# TYPE martin_cache_requests_total counter',
+      'martin_cache_requests_total{cache="font",result="hit"} 5',
+      'martin_cache_requests_total{cache="font",result="miss"} 5',
+      'martin_cache_requests_total{cache="sprite",result="hit"} 9',
+      'martin_cache_requests_total{cache="sprite",result="miss"} 1',
+    ].join('\n');
+
+    const result = parseCacheMetrics(text);
+
+    expect(result.font).toEqual({ byZoom: [], hits: 5, misses: 5 });
+    expect(result.sprite).toEqual({ byZoom: [], hits: 9, misses: 1 });
+    expect(hitRate(result.font)).toBe(0.5);
+    expect(hitRate(result.sprite)).toBe(0.9);
+  });
+
+  it('parses tile-coordinate caches from martin_tile_cache_requests_total with per-zoom breakdown', () => {
+    const text = [
+      '# HELP martin_tile_cache_requests_total Tile-coord cache lookups',
+      '# TYPE martin_tile_cache_requests_total counter',
+      'martin_tile_cache_requests_total{cache="tile",result="hit",zoom="0"} 50',
+      'martin_tile_cache_requests_total{cache="tile",result="miss",zoom="0"} 0',
+      'martin_tile_cache_requests_total{cache="tile",result="hit",zoom="5"} 30',
+      'martin_tile_cache_requests_total{cache="tile",result="miss",zoom="5"} 20',
+      'martin_tile_cache_requests_total{cache="pmtiles_directory",result="hit",zoom="0"} 10',
+      'martin_tile_cache_requests_total{cache="pmtiles_directory",result="miss",zoom="0"} 0',
+    ].join('\n');
+
+    const result = parseCacheMetrics(text);
+
+    expect(result.tile).toEqual({
+      byZoom: [
+        { hits: 50, misses: 0, zoom: 0 },
+        { hits: 30, misses: 20, zoom: 5 },
+      ],
+      hits: 80,
+      misses: 20,
+    });
+    expect(hitRate(result.tile)).toBe(0.8);
+    expect(hitRate(result.tile.byZoom[1])).toBe(0.6);
+    expect(result.pmtiles_directory).toEqual({
+      byZoom: [{ hits: 10, misses: 0, zoom: 0 }],
+      hits: 10,
+      misses: 0,
+    });
+  });
+
+  it('hitRate returns null for caches with no recorded requests', () => {
+    const text = [
+      'martin_cache_requests_total{cache="sprite",result="hit"} 0',
+      'martin_cache_requests_total{cache="sprite",result="miss"} 0',
+    ].join('\n');
+
+    const sprite = parseCacheMetrics(text).sprite;
+    expect(sprite).toEqual({ byZoom: [], hits: 0, misses: 0 });
+    expect(hitRate(sprite)).toBeNull();
+  });
+
+  it('sorts byZoom by zoom level regardless of input order', () => {
+    const text = [
+      'martin_tile_cache_requests_total{cache="tile",result="hit",zoom="14"} 1',
+      'martin_tile_cache_requests_total{cache="tile",result="hit",zoom="2"} 1',
+      'martin_tile_cache_requests_total{cache="tile",result="hit",zoom="0"} 1',
+    ].join('\n');
+
+    const zooms = parseCacheMetrics(text).tile.byZoom.map((b) => b.zoom);
+    expect(zooms).toEqual([0, 2, 14]);
+  });
+
+  it('omits caches that do not appear in the input', () => {
+    const text = 'martin_tile_cache_requests_total{cache="tile",result="hit",zoom="3"} 1';
+    const result = parseCacheMetrics(text);
+    expect(Object.keys(result)).toEqual(['tile']);
+    expect(result.tile.hits).toBe(1);
+    expect(result.tile.byZoom).toEqual([{ hits: 1, misses: 0, zoom: 3 }]);
+  });
+
+  it('ignores unrelated metrics, malformed lines, and unknown result labels', () => {
+    const text = [
+      'other_metric{cache="tile",result="hit"} 999',
+      'martin_tile_cache_requests_total{cache="tile",result="other",zoom="0"} 42',
+      'martin_tile_cache_requests_total{cache="tile",result="hit",zoom="0"} 7',
+      'martin_tile_cache_requests_total{cache="tile",result="miss",zoom="0"} 3',
+      'martin_tile_cache_requests_total{cache="tile",result="hit",zoom="0"} not-a-number',
+    ].join('\n');
+
+    const tile = parseCacheMetrics(text).tile;
+    expect(tile.hits).toBe(7);
+    expect(tile.misses).toBe(3);
+    expect(hitRate(tile)).toBe(0.7);
+  });
+
+  it('handles empty input', () => {
+    expect(parseCacheMetrics('')).toEqual({});
+  });
+
+  it('sums duplicated label combinations (e.g. across workers)', () => {
+    const text = [
+      'martin_cache_requests_total{cache="font",result="hit"} 4',
+      'martin_cache_requests_total{cache="font",result="hit"} 6',
+      'martin_cache_requests_total{cache="font",result="miss"} 10',
+    ].join('\n');
+    expect(parseCacheMetrics(text).font).toEqual({ byZoom: [], hits: 10, misses: 10 });
   });
 });

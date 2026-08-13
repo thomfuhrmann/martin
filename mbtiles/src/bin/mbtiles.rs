@@ -1,16 +1,24 @@
+#![expect(
+    clippy::print_stdout,
+    reason = "binary entrypoint writes results to stdout"
+)]
+
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
 use clap::builder::Styles;
 use clap::builder::styling::AnsiColor;
 use clap::{Parser, Subcommand, ValueEnum};
 use enum_display::EnumDisplay;
-use log::error;
 use mbtiles::{
-    AggHashType, CopyDuplicateMode, CopyType, IntegrityCheckType, MbtResult, MbtTypeCli, Mbtiles,
-    MbtilesCopier, PatchTypeCli, UpdateZoomType, apply_patch,
+    AggHashType, CopyDuplicateMode, CopyType, IntegrityCheckType, MbtError, MbtResult, MbtTypeCli,
+    Mbtiles, MbtilesCopier, PackCompression, PatchTypeCli, TileScheme, UnixSeconds, UpdateZoomType,
+    apply_patch, pack, unpack,
 };
 use serde::{Deserialize, Serialize};
 use tilejson::Bounds;
+use tracing::error;
+use tracing_subscriber::EnvFilter;
 
 /// Defines the styles used for the CLI help output.
 const HELP_STYLES: Styles = Styles::styled()
@@ -24,7 +32,7 @@ const HELP_STYLES: Styles = Styles::styled()
     version,
     name = "mbtiles",
     about = "A utility to work with .mbtiles file content",
-    after_help = "Use RUST_LOG environment variable to control logging level, e.g. RUST_LOG=debug or RUST_LOG=mbtiles=debug. See https://docs.rs/env_logger/latest/env_logger/index.html#enabling-logging for more information.",
+    after_help = "Use RUST_LOG environment variable to control logging level, e.g. RUST_LOG=debug or RUST_LOG=mbtiles=debug. See https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html for more information.",
     styles = HELP_STYLES
 )]
 pub struct Args {
@@ -121,6 +129,42 @@ enum Commands {
         #[arg(long, value_enum)]
         agg_hash: Option<AggHashType>,
     },
+    /// Pack a directory tree of tiles into an `MBTiles` file
+    #[command(name = "pack")]
+    Pack {
+        /// directory to read
+        input_directory: PathBuf,
+        /// `MBTiles` file to write
+        output_file: PathBuf,
+        /// Tile ID scheme for input directory
+        #[arg(long, value_enum, default_value_t)]
+        scheme: TileScheme,
+        /// Compression to store tiles with
+        #[arg(long, value_enum, default_value_t)]
+        compress: PackCompression,
+    },
+    /// Remove expired entries from a tile-cache `MBTiles` file (see the `cache` schema),
+    /// and optionally evict entries to bound the file size
+    #[command(name = "cache-purge")]
+    CachePurge {
+        /// Tile-cache `MBTiles` file to purge
+        file: PathBuf,
+        /// Also evict entries (soonest-expiring first) until the file's live size
+        /// is at most this many MB
+        #[arg(long)]
+        max_size: Option<u64>,
+    },
+    /// Unpack an `MBTiles` file into a directory tree of tiles
+    #[command(name = "unpack")]
+    Unpack {
+        /// `MBTiles` file to read
+        input_file: PathBuf,
+        /// directory to write
+        output_directory: PathBuf,
+        /// Tile ID scheme for output directory
+        #[arg(long, value_enum, default_value_t)]
+        scheme: TileScheme,
+    },
 }
 
 #[derive(Clone, Default, PartialEq, Debug, clap::Args)]
@@ -167,11 +211,15 @@ pub struct DiffArgs {
     reason = "for command line arguments, formatting `TileJSON` is awkward"
 )]
 #[derive(Clone, Default, PartialEq, Debug, clap::Args)]
+#[expect(clippy::struct_excessive_bools, reason = "CLI interface")]
 pub struct SharedCopyOpts {
     /// Limit what gets copied.
     /// When copying tiles only, the agg_tiles_hash will still be updated unless --skip-agg-tiles-hash is set.
     #[arg(long, value_name = "TYPE", default_value_t=CopyType::default())]
     copy: CopyType,
+    /// Use `SQLite` `STRICT` tables when creating a new destination file.
+    #[arg(long)]
+    strict: bool,
     /// Output format of the destination file, ignored if the file exists. If not specified, defaults to the type of source
     #[arg(long, alias = "dst-type", alias = "dst_type", value_name = "SCHEMA")]
     mbtiles_type: Option<MbtTypeCli>,
@@ -227,6 +275,7 @@ impl SharedCopyOpts {
             skip_agg_tiles_hash: self.skip_agg_tiles_hash,
             force: self.force,
             validate: self.validate,
+            strict: self.strict,
             // Constants
             dst_type: None, // Taken from dst_type_cli
         }
@@ -235,12 +284,16 @@ impl SharedCopyOpts {
 
 #[tokio::main]
 async fn main() {
-    let env = env_logger::Env::default().default_filter_or("mbtiles=info");
-    env_logger::Builder::from_env(env)
-        .format_indent(None)
-        .format_module_path(false)
-        .format_target(false)
-        .format_timestamp(None)
+    let env_filter = EnvFilter::builder()
+        .with_default_directive("mbtiles=info".parse().expect("valid default directive"))
+        .from_env_lossy();
+    tracing_subscriber::fmt()
+        .compact()
+        .without_time()
+        .with_target(false)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
         .init();
 
     if let Err(err) = main_int().await {
@@ -322,8 +375,43 @@ async fn main_int() -> anyhow::Result<()> {
                 OutputFormat::JsonPretty => println!("{}", serde_json::to_string_pretty(&summary)?),
             }
         }
+        Commands::Pack {
+            input_directory,
+            output_file,
+            scheme,
+            compress,
+        } => {
+            pack(&input_directory, &output_file, scheme, compress).await?;
+        }
+        Commands::Unpack {
+            input_file,
+            output_directory,
+            scheme,
+        } => {
+            unpack(&input_file, &output_directory, scheme).await?;
+        }
+        Commands::CachePurge { file, max_size } => {
+            cache_purge(file.as_path(), max_size).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn cache_purge(file: &Path, max_size_mb: Option<u64>) -> anyhow::Result<()> {
+    let mbt = Mbtiles::new(file)?;
+    let mut conn = mbt.open().await?;
+    if !mbt.is_cache(&mut conn).await? {
+        return Err(MbtError::NotACacheFile(mbt.filepath().to_owned()).into());
+    }
+    let removed = mbt.purge_expired(&mut conn, UnixSeconds::now()).await?;
+    println!("Removed {removed} expired tile entries");
+    if let Some(max_size_mb) = max_size_mb {
+        let evicted = mbt
+            .purge_cache_to_size(&mut conn, max_size_mb * 1_000_000)
+            .await?;
+        println!("Evicted {evicted} tile entries to fit under {max_size_mb} MB");
+    }
     Ok(())
 }
 
@@ -331,11 +419,11 @@ async fn meta_print_all(file: &Path) -> anyhow::Result<()> {
     let mbt = Mbtiles::new(file)?;
     let mut conn = mbt.open_readonly().await?;
     let metadata = mbt.get_metadata(&mut conn).await?;
-    print!("{}", serde_yaml::to_string(&metadata)?);
+    print!("{}", serde_saphyr::to_string(&metadata)?);
     let tile_info = mbt.detect_format(&metadata.tilejson, &mut conn).await?;
     // For compatibility, pretend tile_info is part of metadata YAML output
     if let Some(tile_info) = tile_info {
-        let encoding = tile_info.encoding.content_encoding().unwrap_or("''");
+        let encoding = tile_info.encoding.compression().unwrap_or("''");
         println!("tile_info:");
         println!("  format: {}", tile_info.format);
         println!("  encoding: {encoding}");
@@ -368,16 +456,18 @@ async fn meta_set_value(file: &Path, key: &str, value: Option<&str>) -> MbtResul
 mod tests {
     use std::path::PathBuf;
 
-    use clap::Parser;
+    use clap::Parser as _;
     use clap::error::ErrorKind;
     use mbtiles::CopyDuplicateMode;
 
     use super::*;
-    use crate::Commands::{ApplyPatch, Copy, Diff, MetaGetValue, MetaSetValue, Validate};
+    use crate::Commands::{
+        ApplyPatch, Copy, Diff, MetaGetValue, MetaSetValue, Pack, Unpack, Validate,
+    };
     use crate::{Args, IntegrityCheckType};
 
     #[test]
-    fn test_copy_no_arguments() {
+    fn copy_no_arguments() {
         assert_eq!(
             Args::try_parse_from(["mbtiles", "copy"])
                 .unwrap_err()
@@ -387,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_minimal_arguments() {
+    fn copy_minimal_arguments() {
         assert_eq!(
             Args::parse_from(["mbtiles", "copy", "src_file", "dst_file"]),
             Args {
@@ -402,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_min_max_zoom_arguments() {
+    fn copy_min_max_zoom_arguments() {
         let args = Args::parse_from([
             "mbtiles",
             "copy",
@@ -432,7 +522,26 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_min_max_zoom_no_arguments() {
+    fn copy_strict_argument() {
+        assert_eq!(
+            Args::parse_from(["mbtiles", "copy", "src_file", "dst_file", "--strict"]),
+            Args {
+                verbose: false,
+                command: Copy(CopyArgs {
+                    src_file: PathBuf::from("src_file"),
+                    dst_file: PathBuf::from("dst_file"),
+                    options: SharedCopyOpts {
+                        strict: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn copy_min_max_zoom_no_arguments() {
         assert_eq!(
             Args::try_parse_from([
                 "mbtiles",
@@ -449,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_min_max_zoom_with_zoom_levels_arguments() {
+    fn copy_min_max_zoom_with_zoom_levels_arguments() {
         assert_eq!(
             Args::try_parse_from([
                 "mbtiles",
@@ -470,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_zoom_levels_arguments() {
+    fn copy_zoom_levels_arguments() {
         assert_eq!(
             Args::parse_from([
                 "mbtiles",
@@ -496,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_diff_with_file_arguments() {
+    fn copy_diff_with_file_arguments() {
         assert_eq!(
             Args::parse_from([
                 "mbtiles",
@@ -519,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_diff_with_override_copy_duplicate_mode() {
+    fn copy_diff_with_override_copy_duplicate_mode() {
         assert_eq!(
             Args::parse_from([
                 "mbtiles",
@@ -545,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_limit() {
+    fn copy_limit() {
         assert_eq!(
             Args::parse_from([
                 "mbtiles", "copy", "src_file", "dst_file", "--copy", "metadata"
@@ -566,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_diff() {
+    fn diff() {
         assert_eq!(
             Args::parse_from([
                 "mbtiles",
@@ -594,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_meta_get_no_arguments() {
+    fn meta_get_no_arguments() {
         assert_eq!(
             Args::try_parse_from(["mbtiles", "meta-get"])
                 .unwrap_err()
@@ -604,21 +713,21 @@ mod tests {
     }
 
     #[test]
-    fn test_meta_get_with_arguments() {
+    fn meta_get_with_arguments() {
         assert_eq!(
             Args::parse_from(["mbtiles", "meta-get", "src_file", "key"]),
             Args {
                 verbose: false,
                 command: MetaGetValue {
                     file: PathBuf::from("src_file"),
-                    key: "key".to_string(),
+                    key: "key".to_owned(),
                 }
             }
         );
     }
 
     #[test]
-    fn test_meta_set_no_arguments() {
+    fn meta_set_no_arguments() {
         assert_eq!(
             Args::try_parse_from(["mbtiles", "meta-get"])
                 .unwrap_err()
@@ -628,14 +737,14 @@ mod tests {
     }
 
     #[test]
-    fn test_meta_set_no_value_argument() {
+    fn meta_set_no_value_argument() {
         assert_eq!(
             Args::parse_from(["mbtiles", "meta-set", "src_file", "key"]),
             Args {
                 verbose: false,
                 command: MetaSetValue {
                     file: PathBuf::from("src_file"),
-                    key: "key".to_string(),
+                    key: "key".to_owned(),
                     value: None
                 }
             }
@@ -643,22 +752,22 @@ mod tests {
     }
 
     #[test]
-    fn test_meta_get_with_all_arguments() {
+    fn meta_get_with_all_arguments() {
         assert_eq!(
             Args::parse_from(["mbtiles", "meta-set", "src_file", "key", "value"]),
             Args {
                 verbose: false,
                 command: MetaSetValue {
                     file: PathBuf::from("src_file"),
-                    key: "key".to_string(),
-                    value: Some("value".to_string())
+                    key: "key".to_owned(),
+                    value: Some("value".to_owned())
                 }
             }
         );
     }
 
     #[test]
-    fn test_apply_diff_with_arguments() {
+    fn apply_diff_with_arguments() {
         assert_eq!(
             Args::parse_from(["mbtiles", "apply-diff", "src_file", "diff_file"]),
             Args {
@@ -673,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate() {
+    fn validate() {
         assert_eq!(
             Args::parse_from(["mbtiles", "validate", "src_file", "--agg-hash", "off"]),
             Args {
@@ -683,6 +792,85 @@ mod tests {
                     integrity_check: IntegrityCheckType::Quick,
                     update_agg_tiles_hash: false,
                     agg_hash: Some(AggHashType::Off),
+                }
+            }
+        );
+    }
+
+    // Behavioural pack/unpack coverage (round-trips, scheme flips, compression, metadata,
+    // and CLI error paths) lives in `integration-tests/tests/mbtiles_cli.rs`, which drives the
+    // real binary against fixture MBTiles. The unit tests below only cover argument parsing;
+    // the `pack`/`unpack` logic and its `tile_coords` parser are tested in the `mbtiles::pack`
+    // module.
+
+    #[test]
+    fn pack_defaults() {
+        assert_eq!(
+            Args::parse_from(["mbtiles", "pack", "src_dir", "out.mbtiles"]),
+            Args {
+                verbose: false,
+                command: Pack {
+                    input_directory: PathBuf::from("src_dir"),
+                    output_file: PathBuf::from("out.mbtiles"),
+                    scheme: TileScheme::Xyz,
+                    compress: PackCompression::Auto,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn pack_tms_uncompressed() {
+        assert_eq!(
+            Args::parse_from([
+                "mbtiles",
+                "pack",
+                "src_dir",
+                "out.mbtiles",
+                "--scheme",
+                "tms",
+                "--compress",
+                "none",
+            ]),
+            Args {
+                verbose: false,
+                command: Pack {
+                    input_directory: PathBuf::from("src_dir"),
+                    output_file: PathBuf::from("out.mbtiles"),
+                    scheme: TileScheme::Tms,
+                    compress: PackCompression::None,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn pack_compress_gzip_alias() {
+        let Pack { compress, .. } =
+            Args::parse_from(["mbtiles", "pack", "src", "out.mbtiles", "--compress", "gz"]).command
+        else {
+            panic!("expected a pack command");
+        };
+        assert_eq!(compress, PackCompression::Gzip);
+    }
+
+    #[test]
+    fn unpack_scheme() {
+        assert_eq!(
+            Args::parse_from([
+                "mbtiles",
+                "unpack",
+                "in.mbtiles",
+                "out_dir",
+                "--scheme",
+                "tms"
+            ]),
+            Args {
+                verbose: false,
+                command: Unpack {
+                    input_file: PathBuf::from("in.mbtiles"),
+                    output_directory: PathBuf::from("out_dir"),
+                    scheme: TileScheme::Tms,
                 }
             }
         );

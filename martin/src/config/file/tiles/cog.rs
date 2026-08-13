@@ -8,19 +8,25 @@ use url::Url;
 
 use crate::MartinResult;
 use crate::config::file::{
-    ConfigurationLivecycleHooks, TileSourceConfiguration, UnrecognizedKeys, UnrecognizedValues,
+    CachePolicy, CollectUnrecognizedKeys, ConfigurationLivecycleHooks, TileSourceConfiguration,
+    UnrecognizedValues,
 };
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    CollectUnrecognizedKeys,
+    ConfigurationLivecycleHooks,
+)]
+#[cfg_attr(feature = "unstable-schemas", derive(schemars::JsonSchema))]
 pub struct CogConfig {
     #[serde(flatten, skip_serializing)]
+    #[cfg_attr(feature = "unstable-schemas", schemars(skip))]
     pub unrecognized: UnrecognizedValues,
-}
-
-impl ConfigurationLivecycleHooks for CogConfig {
-    fn get_unrecognized_keys(&self) -> UnrecognizedKeys {
-        self.unrecognized.keys().cloned().collect()
-    }
 }
 
 impl TileSourceConfiguration for CogConfig {
@@ -28,12 +34,22 @@ impl TileSourceConfiguration for CogConfig {
         false
     }
 
-    async fn new_sources(&self, id: String, path: PathBuf) -> MartinResult<BoxedSource> {
-        let cog = CogSource::new(id, path)?;
+    async fn new_sources(
+        &self,
+        id: String,
+        path: PathBuf,
+        cache: CachePolicy,
+    ) -> MartinResult<BoxedSource> {
+        let cog = CogSource::new(id, path, cache.zoom())?;
         Ok(Box::new(cog))
     }
 
-    async fn new_sources_url(&self, _id: String, _url: Url) -> MartinResult<BoxedSource> {
+    async fn new_sources_url(
+        &self,
+        _id: String,
+        _url: Url,
+        _cache: CachePolicy,
+    ) -> MartinResult<BoxedSource> {
         unreachable!()
     }
 }

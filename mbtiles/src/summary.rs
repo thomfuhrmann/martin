@@ -6,7 +6,7 @@
 
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
-use std::str::FromStr;
+use std::str::FromStr as _;
 
 use martin_tile_utils::{get_zoom_precision, xyz_to_bbox};
 use serde::Serialize;
@@ -115,6 +115,7 @@ impl Display for Summary {
 
 impl Mbtiles {
     /// Compute `MBTiles` file summary
+    #[hotpath::measure]
     pub async fn summary<T>(&self, conn: &mut T) -> MbtResult<Summary>
     where
         for<'e> &'e mut T: SqliteExecutor<'e>,
@@ -145,7 +146,7 @@ impl Mbtiles {
            count()                AS count,
            min(length(tile_data)) AS smallest,
            max(length(tile_data)) AS largest,
-           avg(length(tile_data)) AS average,
+           cast(avg(length(tile_data)) AS REAL) AS average,
            min(tile_column)       AS min_tile_x,
            min(tile_row)          AS min_tile_y,
            max(tile_column)       AS max_tile_x,
@@ -159,7 +160,8 @@ impl Mbtiles {
         let zoom_info: Vec<ZoomInfo> = zoom_info
             .into_iter()
             .map(|r| {
-                let zoom = u8::try_from(r.zoom.unwrap()).expect("zoom_level is not a u8");
+                let zoom = u8::try_from(r.zoom.expect("zoom_level should not be NULL"))
+                    .expect("zoom_level should fit in a u8");
                 ZoomInfo {
                     zoom,
                     tile_count: r.count as u64,
@@ -168,10 +170,16 @@ impl Mbtiles {
                     avg_tile_size: r.average.unwrap_or(0.0),
                     bbox: xyz_to_bbox(
                         zoom,
-                        r.min_tile_x.expect("we are mapping over a value, so there is a value -> min_tile_x cannot be None") as u32,
-                        invert_y_value(zoom, r.max_tile_y.expect("we are mapping over a value, so there is a value -> max_tile_y cannot be None") as u32),
-                        r.max_tile_x.expect("we are mapping over a value, so there is a value -> max_tile_x cannot be None") as u32,
-                        invert_y_value(zoom, r.min_tile_y.expect("we are mapping over a value, so there is a value -> min_tile_y cannot be None") as u32),
+                        r.min_tile_x.expect("min_tile_x should not be None") as u32,
+                        invert_y_value(
+                            zoom,
+                            r.max_tile_y.expect("max_tile_y should not be None") as u32,
+                        ),
+                        r.max_tile_x.expect("max_tile_x should not be None") as u32,
+                        invert_y_value(
+                            zoom,
+                            r.min_tile_y.expect("min_tile_y should not be None") as u32,
+                        ),
                     )
                     .into(),
                 }
@@ -185,7 +193,7 @@ impl Mbtiles {
             .sum::<f64>();
 
         Ok(Summary {
-            file_path: self.filepath().to_string(),
+            file_path: self.filepath().to_owned(),
             file_size,
             mbt_type,
             page_size,
@@ -214,7 +222,9 @@ mod tests {
         let mbt = Mbtiles::new(":memory:").unwrap();
         let mut conn = mbt.open().await.unwrap();
 
-        init_mbtiles_schema(&mut conn, MbtType::Flat).await.unwrap();
+        init_mbtiles_schema(&mut conn, MbtType::Flat, false)
+            .await
+            .unwrap();
         let res = mbt.summary(&mut conn).await.unwrap();
         assert_yaml_snapshot!(res, @r#"
         file_path: ":memory:"

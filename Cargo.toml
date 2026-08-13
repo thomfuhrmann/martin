@@ -1,12 +1,19 @@
 [workspace]
 resolver = "3"
-members = ["martin", "martin-core", "martin-tile-utils", "mbtiles"]
+members = [
+    "integration-tests",
+    "martin",
+    "martin-config-macros",
+    "martin-core",
+    "martin-tile-utils",
+    "mbtiles",
+]
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/maplibre/martin"
-rust-version = "1.88"
+rust-version = "1.94"
 homepage = "https://martin.maplibre.org/"
 
 [workspace.lints.rust]
@@ -17,10 +24,51 @@ unused_qualifications = "warn"
 
 [workspace.lints.clippy]
 # Restrictions
-unimplemented = "warn"
-panic_in_result_fn = "warn"
+absolute_paths = "warn"
+as_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+create_dir = "warn"
+dbg_macro = "warn"
+empty_drop = "warn"
+empty_structs_with_brackets = "warn"
+error_impl_error = "warn"
+exit = "warn"
+filetype_is_file = "warn"
+format_push_string = "warn"
+if_then_some_else_none = "warn"
+lossy_float_literal = "warn"
+map_err_ignore = "warn"
+mem_forget = "warn"
+mixed_read_write_in_expression = "warn"
+multiple_unsafe_ops_per_block = "warn"
+negative_feature_names = "warn"
 panic = "warn"
+panic_in_result_fn = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+redundant_feature_names = "warn"
+redundant_test_prefix = "warn"
+redundant_type_annotations = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+return_and_then = "warn"
+same_name_method = "warn"
+str_to_string = "warn"
+string_slice = "warn"
 todo = "warn"
+try_err = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unnecessary_safety_doc = "warn"
+unnecessary_self_imports = "warn"
+unneeded_field_pattern = "warn"
+unwrap_used = "warn"
+unused_trait_names = "warn"
+use_self = "warn"
+verbose_file_reads = "warn"
+
 # Pedantics without being too noisy
 pedantic = { level = "warn", priority = -1 }
 derive_partial_eq_without_eq = "allow"
@@ -34,7 +82,7 @@ struct_field_names = "allow"
 [workspace.dependencies]
 actix-cors = "0.7"
 actix-http = "3"
-actix-middleware-etag = "0.4.6"
+actix-middleware-etag = "0.5.0"
 actix-rt = "2"
 actix-web = "4"
 actix-web-prom = "0.10.0"
@@ -42,12 +90,16 @@ actix-web-static-files = "4"
 anyhow = "1.0"
 approx = "0.5.1"
 async-trait = "0.1"
-base64 = "0.22.1"
-bit-set = "0.8"
+aws-config = "1.9"
+aws-credential-types = "1.3"
+aws-runtime = "1.8"
+backon = "1.6.0"
+base64 = "0.23.0"
+bit-set = "0.11"
 brotli = ">=5, <9"
+bytemuck = "1.25.2"
 bytes = "1"
-bytemuck = "1.25.0"
-chrono = "0.4.43"
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
 clap = { version = "4", features = [
     "derive",
     "unstable-markdown",
@@ -58,37 +110,60 @@ criterion = { version = "0.8", features = [
     "async_tokio",
     "html_reports",
 ] }
+csscolorparser = "0.8"
 dashmap = { version = "6.1.0", features = ["serde", "inline", "rayon"] }
+deadpool = "0.13.0"
 deadpool-postgres = "0.14"
+derive-debug = "0.1.2"
+duckdb = { version = "1.10503.1", features = ["bundled", "parquet"] }
 enum-display = "0.2"
 env_logger = "0.11"
 flate2 = "1"
 flume = "0.12"
 futures = "0.3"
-image = "0.25.8"
+geo = "0.33.1"
+geo-index = { version = "0.3.3", features = ["rayon"] }
+geo-types = "0.7.18"
+geojson = { version = "1", features = ["geo-types"] }
+hotpath = "0.22"
+humantime-serde = "1.1.1"
+image = { version = "0.25.8", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+] }
+image-compare = "0.5"
+indicatif = "0.18.3"
 indoc = "2"
-insta = "1.44.3"
-itertools = "0.14"
+insta = "1.46.3"
+itertools = "0.15"
 json-patch = "4"
 lambda-web = { version = "0.2.1", features = ["actix4"] }
 log = "0.4"
-maplibre_native = "0.4.1"
-martin-core = { path = "./martin-core", version = "0.2.6", default-features = false }
-martin-tile-utils = { path = "./martin-tile-utils", version = "0.6.9" }
-mbtiles = { path = "./mbtiles", version = "0.15.1" }
+maplibre_native = "0.8.5"
+martin-config-macros = { path = "./martin-config-macros", version = "0.1.0" }
+martin-core = { path = "./martin-core", version = "0.10.0", default-features = false }
+martin-tile-utils = { path = "./martin-tile-utils", version = "0.7.5" }
+mbtiles = { path = "./mbtiles", version = "0.19.0" }
 md5 = "0.8.0"
-moka = { version = "0.12", features = ["future"] }
+miette = { version = "7.6", features = ["fancy"] }
+mlt-core = { version = "0.12.3", default-features = false }
+moka = { version = "0.12", default-features = false }
 ndarray = "0.17.2"
+notify = "8.2.0"
 num_cpus = "1"
-object_store = { version = "0.13.1", features = [
+object_store = { version = "0.14.1", features = [
     "gcp",
     "aws",
     "azure",
     "fs",
     "http",
 ] }
-pbf_font_tools = { version = "3.0.0", features = ["freetype"] }
-pmtiles = { version = "0.19.1", features = ["tilejson", "object-store"] }
+pbf_font_tools = { version = "3.1.1", features = ["freetype"] }
+pmtiles = { version = "0.23.0", default-features = false, features = [
+    "tilejson",
+    "object-store",
+] }
 png = "0.18.0"
 postgis = "0.9"
 postgres = { version = "0.19", features = [
@@ -98,19 +173,33 @@ postgres = { version = "0.19", features = [
 ] }
 postgres-protocol = "0.6"
 pretty_assertions = "1"
+proc-macro2 = "1"
+prometheus = { version = "0.14", default-features = false }
 proj = "0.31.0"
+quote = "1"
+rayon = "1.11.0"
+rcgen = "0.14"
 regex = "1"
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "http2",
+] }
 rstest = "0.26.1"
-rustls = "0.23.36"
+rustls = "0.23.38"
 # ring feature does not require NASM windows executable, but works slower
 #rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
+schemars = { version = "1.2", default-features = false, features = [
+    "chrono04",
+    "derive",
+    "std",
+] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "0.0.29", features = ["miette", "properties"] }
 serde_json = "1"
 serde_with = { version = "3", default-features = false, features = ["macros"] }
-serde_yaml = "0.9"
 size_format = "1.0.2"
 spreet = { version = "0.13", default-features = false }
 sqlite-compressions = { version = "0.3", default-features = false, features = [
@@ -122,29 +211,39 @@ sqlite-hashes = { version = "0.10.6", default-features = false, features = [
     "aggregate",
     "hex",
 ] }
-sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio"] }
+sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio"] }
 static-files = "0.2"
-subst = { version = "0.3", features = ["yaml"] }
+strum = { version = "0.28", features = ["derive"] }
+syn = { version = "3", features = ["full"] }
 tempfile = "3.21.0"
-testcontainers-modules = { version = "0.14.0", features = [
+test_each_file = "0.3"
+testcontainers-modules = { version = "0.15.0", features = [
     "postgres",
     "blocking",
+    "minio",
 ] }
 thiserror = "2"
 tiff = "0.11.1"
 tilejson = "0.4"
 tokio = { version = "1", features = ["macros"] }
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 tracing = "0.1.44"
 tracing-actix-web = "0.7.21"
+tracing-indicatif = "0.3"
 tracing-log = { version = "0.2.0", features = ["interest-cache"] }
 tracing-subscriber = { version = "0.3", default-features = false }
 tracing-test = "0.2"
 url = "2.5"
+utoipa = { version = "5.4", default-features = false, features = [
+    "chrono",
+    "macros",
+    "actix_extras",
+] }
 walkdir = "2.5.0"
+wiremock = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-zarrs = "0.23.0"
-zstd = "0.13.3"
+zarrs = "0.23.13"
+zstd = "0.13"
 
 [profile.dev.package]
 # See https://github.com/launchbadge/sqlx#compile-time-verification

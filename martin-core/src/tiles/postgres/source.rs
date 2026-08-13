@@ -1,16 +1,15 @@
 use async_trait::async_trait;
 use deadpool_postgres::tokio_postgres::types::{ToSql, Type};
-use martin_tile_utils::Encoding::Uncompressed;
-use martin_tile_utils::Format::Mvt;
 use martin_tile_utils::{TileCoord, TileData, TileInfo};
 use tilejson::TileJSON;
-use tracing::debug;
+use tracing::{debug, instrument};
 
+use crate::CacheZoomRange;
 use crate::tiles::postgres::PostgresError::{
     GetTileError, GetTileWithQueryError, PrepareQueryError,
 };
-use crate::tiles::postgres::PostgresPool;
 use crate::tiles::postgres::utils::query_to_json;
+use crate::tiles::postgres::{ActiveQueryRegistry, PostgresPool};
 use crate::tiles::{BoxedSource, MartinCoreResult, Source, UrlQuery};
 
 #[derive(Clone, Debug)]
@@ -20,17 +19,28 @@ pub struct PostgresSource {
     info: PostgresSqlInfo,
     pool: PostgresPool,
     tilejson: TileJSON,
+    tile_info: TileInfo,
+    cache_zoom: CacheZoomRange,
 }
 
 impl PostgresSource {
     /// Creates a new `PostgreSQL` tile source.
     #[must_use]
-    pub fn new(id: String, info: PostgresSqlInfo, tilejson: TileJSON, pool: PostgresPool) -> Self {
+    pub fn new(
+        id: String,
+        info: PostgresSqlInfo,
+        tilejson: TileJSON,
+        pool: PostgresPool,
+        tile_info: TileInfo,
+        cache_zoom: CacheZoomRange,
+    ) -> Self {
         Self {
             id,
             info,
             pool,
             tilejson,
+            tile_info,
+            cache_zoom,
         }
     }
 }
@@ -46,7 +56,7 @@ impl Source for PostgresSource {
     }
 
     fn get_tile_info(&self) -> TileInfo {
-        TileInfo::new(Mvt, Uncompressed)
+        self.tile_info
     }
 
     fn clone_source(&self) -> BoxedSource {
@@ -62,12 +72,37 @@ impl Source for PostgresSource {
         true
     }
 
+    fn cache_zoom(&self) -> CacheZoomRange {
+        self.cache_zoom
+    }
+
+    fn cancel_registry(&self) -> Option<ActiveQueryRegistry> {
+        Some(self.pool.active_query_registry().clone())
+    }
+
+    #[instrument(
+        level = "debug",
+        skip_all,
+        fields(
+            source.id = %self.id,
+            tile.z = xyz.z,
+            tile.x = xyz.x,
+            tile.y = xyz.y,
+        ),
+        err(Debug),
+    )]
     async fn get_tile(
         &self,
         xyz: TileCoord,
         url_query: Option<&UrlQuery>,
     ) -> MartinCoreResult<TileData> {
         let conn = self.pool.get().await?;
+
+        let cancel_token = conn.cancel_token();
+
+        // Auto-clean up if task completes or is interrupted
+        let _query_guard = self.pool.active_query_registry().register(cancel_token);
+
         let param_types: &[Type] = if self.support_url_query() {
             &[Type::INT2, Type::INT8, Type::INT8, Type::JSON]
         } else {
@@ -78,13 +113,11 @@ impl Source for PostgresSource {
         let prep_query = conn
             .prepare_typed_cached(sql, param_types)
             .await
-            .map_err(|e| {
-                PrepareQueryError(
-                    e,
-                    self.id.clone(),
-                    self.info.signature.clone(),
-                    self.info.sql_query.clone(),
-                )
+            .map_err(|e| PrepareQueryError {
+                source: e,
+                source_id: self.id.clone(),
+                signature: self.info.signature.clone(),
+                query: self.info.sql_query.clone(),
             })?;
 
         let tile = if self.support_url_query() {
@@ -107,7 +140,10 @@ impl Source for PostgresSource {
         };
 
         let tile = tile
-            .map(|row| row.and_then(|r| r.get::<_, Option<TileData>>(0)))
+            .map(|row| {
+                let r = row?;
+                r.get::<_, Option<TileData>>(0)
+            })
             .map_err(|e| {
                 if self.support_url_query() {
                     GetTileWithQueryError(e, self.id.clone(), xyz, url_query.cloned())

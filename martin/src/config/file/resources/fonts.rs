@@ -1,30 +1,40 @@
+use crate::config::file::CollectUnrecognizedKeys;
 use std::collections::BTreeMap;
 
 use martin_core::fonts::FontSources;
 use serde::{Deserialize, Serialize};
 
 use crate::config::file::{
-    ConfigFileError, ConfigFileResult, ConfigurationLivecycleHooks, FileConfigEnum,
-    UnrecognizedKeys, UnrecognizedValues,
+    CacheSizeConfig, ConfigFileError, ConfigFileResult, ConfigurationLivecycleHooks,
+    FileConfigEnum, UnrecognizedValues,
 };
 
 #[serde_with::skip_serializing_none]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    CollectUnrecognizedKeys,
+    ConfigurationLivecycleHooks,
+)]
+#[cfg_attr(feature = "unstable-schemas", derive(schemars::JsonSchema))]
 pub struct InnerFontConfig {
-    /// Size of the font cache in megabytes (0 to disable)
-    ///
-    /// Overrides [`cache_size_mb`](crate::config::file::Config::cache_size_mb).
-    pub cache_size_mb: Option<u64>,
+    /// Cache configuration for fonts.
+    /// Use `cache: disable` to disable font caching.
+    #[serde(default, skip_serializing_if = "CacheSizeConfig::is_empty")]
+    #[cfg_attr(
+        feature = "unstable-schemas",
+        schemars(with = "crate::config::file::CacheSizeConfigShape")
+    )]
+    pub cache: CacheSizeConfig,
 
     #[serde(flatten, skip_serializing)]
+    #[cfg_attr(feature = "unstable-schemas", schemars(skip))]
     pub unrecognized: UnrecognizedValues,
 }
-impl ConfigurationLivecycleHooks for InnerFontConfig {
-    fn get_unrecognized_keys(&self) -> UnrecognizedKeys {
-        self.unrecognized.keys().cloned().collect()
-    }
-}
-
 pub type FontConfig = FileConfigEnum<InnerFontConfig>;
 
 impl FontConfig {
@@ -54,7 +64,7 @@ impl FontConfig {
                 .map_err(|e| ConfigFileError::FontResolutionFailed(e, base_path.clone()))?;
         }
 
-        *self = FileConfigEnum::new_extended(directories, configs, cfg.custom);
+        *self = Self::new_extended(directories, configs, cfg.custom);
 
         Ok(results)
     }

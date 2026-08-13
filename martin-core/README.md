@@ -14,8 +14,13 @@ The library providing the basic building blocks for [Martin](https://maplibre.or
   - [x] mbtiles
   - [x] pmtiles
   - [x] cog
+  - [x] geojson
   - [x] postgres tables
   - [x] postgres functions
+  - [x] duckdb tables
+  - [x] duckdb functions
+  - [x] geoparquet files
+  - [x] passthrough (upstream HTTP tile server)
 - resources
   - [x] sprites
   - [x] fonts

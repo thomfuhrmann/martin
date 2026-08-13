@@ -2,16 +2,17 @@ use std::fs::File;
 use std::io;
 use std::io::BufReader;
 use std::path::PathBuf;
-use std::str::FromStr;
+use std::str::FromStr as _;
+use std::sync::{Arc, LazyLock};
 
-use deadpool_postgres::tokio_postgres::Config;
 use deadpool_postgres::tokio_postgres::config::SslMode;
+use deadpool_postgres::tokio_postgres::{Config, NoTls};
 use regex::Regex;
+use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::aws_lc_rs::default_provider;
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
+use rustls::crypto::{aws_lc_rs, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+use rustls::{CertificateError, DigitallySignedStruct, Error, SignatureScheme};
 use rustls_native_certs::load_native_certs;
 use rustls_pemfile::Item::Pkcs1Key;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -22,6 +23,21 @@ use crate::tiles::postgres::PostgresError::{
     InvalidPrivateKey, UnknownSslMode,
 };
 use crate::tiles::postgres::PostgresResult;
+
+/// Pool TLS settings (`NoTls` or rustls), cloned for query cancel.
+///
+/// Cancel opens a new connection, so it needs the same connector the pool uses.
+#[derive(Clone)]
+pub(crate) enum PgTlsConnector {
+    NoTls(NoTls),
+    Rustls(MakeRustlsConnect),
+}
+
+impl Default for PgTlsConnector {
+    fn default() -> Self {
+        Self::NoTls(NoTls)
+    }
+}
 
 /// A temporary workaround for <https://github.com/sfackler/rust-postgres/pull/988>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +65,7 @@ pub fn parse_conn_str(conn_str: &str) -> PostgresResult<(Config, SslModeOverride
     } else {
         Config::from_str(conn_str)
     };
-    let mut pg_cfg = pg_cfg.map_err(|e| BadConnectionString(e, conn_str.to_string()))?;
+    let mut pg_cfg = pg_cfg.map_err(|e| BadConnectionString(e, conn_str.into()))?;
     if let SslModeOverride::Unmodified(_) = mode {
         mode = SslModeOverride::Unmodified(pg_cfg.get_ssl_mode());
     }
@@ -62,7 +78,7 @@ pub fn parse_conn_str(conn_str: &str) -> PostgresResult<(Config, SslModeOverride
 }
 
 #[derive(Debug)]
-struct NoCertificateVerification {}
+struct NoCertificateVerification;
 
 impl ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
@@ -86,7 +102,7 @@ impl ServerCertVerifier for NoCertificateVerification {
             message,
             cert,
             dss,
-            &default_provider().signature_verification_algorithms,
+            &aws_lc_rs::default_provider().signature_verification_algorithms,
         )
     }
 
@@ -100,14 +116,65 @@ impl ServerCertVerifier for NoCertificateVerification {
             message,
             cert,
             dss,
-            &default_provider().signature_verification_algorithms,
+            &aws_lc_rs::default_provider().signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        default_provider()
+        aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// Verifies the certificate chain against the configured roots but accepts a hostname mismatch.
+///
+/// This implements the semantics of `sslmode=verify-ca`, which checks that the server certificate
+/// is signed by a trusted CA while skipping the hostname check performed by `verify-full`.
+/// See <https://www.postgresql.org/docs/current/libpq-ssl.html#LIBQ-SSL-CERTIFICATES>.
+#[derive(Debug)]
+struct NoHostnameVerification(Arc<WebPkiServerVerifier>);
+
+impl ServerCertVerifier for NoHostnameVerification {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        match self
+            .0
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            Err(Error::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => Ok(ServerCertVerified::assertion()),
+            other => other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_verify_schemes()
     }
 }
 
@@ -123,13 +190,26 @@ fn cert_reader(file: &PathBuf) -> PostgresResult<BufReader<File>> {
     ))
 }
 
+/// Ensure a rustls crypto provider is installed (no-op if one already is).
+///
+/// Needed when `make_connector` runs outside normal martin startup (e.g. tests),
+/// which does not call `martin::init_aws_lc_tls`.
+fn ensure_rustls_provider() {
+    static INIT_TLS: LazyLock<()> = LazyLock::new(|| {
+        let _ = aws_lc_rs::default_provider().install_default();
+    });
+    *INIT_TLS;
+}
+
 pub fn make_connector(
     ssl_cert: Option<&PathBuf>,
     ssl_key: Option<&PathBuf>,
     ssl_root_cert: Option<&PathBuf>,
     ssl_mode: SslModeOverride,
 ) -> PostgresResult<MakeRustlsConnect> {
-    let (verify_ca, _verify_hostname) = match ssl_mode {
+    ensure_rustls_provider();
+
+    let (verify_ca, verify_hostname) = match ssl_mode {
         SslModeOverride::Unmodified(mode) => match mode {
             SslMode::Disable | SslMode::Prefer => (false, false),
             SslMode::Require => match ssl_root_cert {
@@ -167,15 +247,20 @@ pub fn make_connector(
         }
     }
 
-    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let roots = Arc::new(roots);
+    let builder = rustls::ClientConfig::builder().with_root_certificates(Arc::clone(&roots));
 
     let mut builder = if let (Some(cert), Some(key)) = (ssl_cert, ssl_key) {
         match rustls_pemfile::read_one(&mut cert_reader(key)?) {
             Ok(Some(Pkcs1Key(rsa_key))) => builder
                 .with_client_auth_cert(read_certs(cert)?, rsa_key.into())
-                .map_err(|e| CannotUseClientKey(e, cert.clone(), key.clone()))?,
-            Ok(_) => Err(InvalidPrivateKey(key.clone()))?,
-            Err(e) => Err(CannotParseCert(e, key.clone()))?,
+                .map_err(|e| CannotUseClientKey {
+                    source: e,
+                    cert: cert.clone(),
+                    key: key.clone(),
+                })?,
+            Ok(_) => return Err(InvalidPrivateKey(key.clone())),
+            Err(e) => return Err(CannotParseCert(e, key.clone())),
         }
     } else {
         if ssl_key.is_some() || ssl_key.is_some() {
@@ -189,20 +274,15 @@ pub fn make_connector(
     if !verify_ca {
         builder
             .dangerous()
-            .set_certificate_verifier(std::sync::Arc::new(NoCertificateVerification {}));
+            .set_certificate_verifier(Arc::new(NoCertificateVerification));
+    } else if !verify_hostname {
+        let verifier = WebPkiServerVerifier::builder(roots).build()?;
+        builder
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoHostnameVerification(verifier)));
     }
 
-    let connector = MakeRustlsConnect::new(builder);
-
-    // TODO: ???
-    // if !verify_hostname {
-    //     connector.set_callback(|cfg, _domain| {
-    //         cfg.set_verify_hostname(false);
-    //         Ok(())
-    //     });
-    // }
-
-    Ok(connector)
+    Ok(MakeRustlsConnect::new(builder))
 }
 
 #[cfg(test)]
@@ -212,9 +292,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_conn_str() {
+    fn parses_conn_str() {
         let (cfg, mode) = parse_conn_str("postgres://user:password@localhost:5432/dbname").unwrap();
-        assert_eq!(cfg.get_hosts(), &vec![Host::Tcp("localhost".to_string())]);
+        assert_eq!(cfg.get_hosts(), &vec![Host::Tcp("localhost".to_owned())]);
         assert_eq!(cfg.get_ports(), &vec![5432]);
         assert_eq!(cfg.get_user(), Some("user"));
         assert_eq!(cfg.get_dbname(), Some("dbname"));

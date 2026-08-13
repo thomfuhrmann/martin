@@ -1,17 +1,17 @@
 use std::fmt::Display;
 use std::path::PathBuf;
-use std::str::FromStr;
+use std::str::FromStr as _;
 
-use futures::TryStreamExt;
-use log::{info, warn};
+use futures::TryStreamExt as _;
 use serde::Serialize;
 use serde_json::{Value as JSONValue, Value, json};
-use sqlx::{SqliteConnection, SqliteExecutor, query};
+use sqlx::{AssertSqlSafe, SqliteConnection, SqliteExecutor, query};
 use tilejson::{Bounds, Center, TileJSON, tilejson};
+use tracing::{info, warn};
 
 use crate::MbtError::InvalidZoomValue;
-use crate::Mbtiles;
 use crate::errors::MbtResult;
+use crate::{Mbtiles, compute_min_max_zoom};
 
 /// Tileset metadata combining [MBTiles](https://github.com/mapbox/mbtiles-spec)
 /// and [TileJSON](https://github.com/mapbox/tilejson-spec) specifications.
@@ -67,8 +67,12 @@ impl Mbtiles {
         match val {
             Ok(v) => Some(v),
             Err(err) => {
-                let name = &self.filename();
-                warn!("Unable to parse metadata {title} value in {name}: {err}");
+                warn!(
+                    metadata.title = %title,
+                    mbtiles.file = %self.filename(),
+                    error = %err,
+                    "Unable to parse metadata value"
+                );
                 None
             }
         }
@@ -99,7 +103,7 @@ impl Mbtiles {
     {
         self.get_metadata_value(conn, zoom_name)
             .await?
-            .map(|v| v.parse().map_err(|_| InvalidZoomValue(zoom_name, v)))
+            .map(|v| v.parse().map_err(|_err| InvalidZoomValue(zoom_name, v)))
             .transpose()
     }
 
@@ -173,6 +177,7 @@ impl Mbtiles {
     /// # Ok(())
     /// # }
     /// ```
+    #[hotpath::measure]
     pub async fn get_metadata<T>(&self, conn: &mut T) -> MbtResult<Metadata>
     where
         for<'e> &'e mut T: SqliteExecutor<'e>,
@@ -201,21 +206,27 @@ impl Mbtiles {
                     "legend" => tj.legend = Some(value),
                     "template" => tj.template = Some(value),
                     "json" => json = self.to_val(serde_json::from_str(&value), &name),
-                    "format" | "generator" => {
+                    "format" | "generator" | "compression" => {
                         tj.other.insert(name, Value::String(value));
                     }
                     "agg_tiles_hash" => agg_tiles_hash = Some(value),
                     "scheme" => {
                         if value != "tms" {
-                            let file = &self.filename();
                             warn!(
-                                "File {file} has an unexpected metadata value {name}='{value}'. Only 'tms' is supported. Ignoring."
+                                mbtiles.file = %self.filename(),
+                                metadata.name = %name,
+                                metadata.value = %value,
+                                "Unexpected metadata value; only 'tms' is supported. Ignoring."
                             );
                         }
                     }
                     _ => {
-                        let file = &self.filename();
-                        info!("{file} has an unrecognized metadata value {name}={value}");
+                        info!(
+                            mbtiles.file = %self.filename(),
+                            metadata.name = %name,
+                            metadata.value = %value,
+                            "Unrecognized metadata value"
+                        );
                         tj.other.insert(name, Value::String(value));
                     }
                 }
@@ -241,8 +252,14 @@ impl Mbtiles {
         // Need to drop rows in order to re-borrow connection reference as mutable
         drop(rows);
 
+        // the metadata zoom range can claim more than the tiles table actually
+        // holds (#1791), so reconcile it against the real extent.
+        if let Some((min_zoom, max_zoom)) = compute_min_max_zoom(&mut *conn).await? {
+            reconcile_zoom_levels(&mut tj, min_zoom, max_zoom);
+        }
+
         Ok(Metadata {
-            id: self.filename().to_string(),
+            id: self.filename().to_owned(),
             tilejson: tj,
             layer_type,
             json,
@@ -283,6 +300,7 @@ impl Mbtiles {
     /// # Ok(())
     /// # }
     /// ```
+    #[hotpath::measure]
     pub async fn insert_metadata<T>(&self, conn: &mut T, tile_json: &TileJSON) -> MbtResult<()>
     where
         for<'e> &'e mut T: SqliteExecutor<'e>,
@@ -332,11 +350,48 @@ impl Mbtiles {
     }
 }
 
+/// reconcile a declared `(minzoom, maxzoom)` against the `[tile_min, tile_max]`
+/// the tiles actually cover (#1791) - a missing value just falls back to the extent.
+///
+/// ```text
+/// minzoom = min(tile_min, declared_max, declared_min)
+/// maxzoom = min(tile_max, max(tile_min, declared_max, declared_min))
+/// ```
+fn reconciled_zoom_range(
+    declared_min: Option<u8>,
+    declared_max: Option<u8>,
+    tile_min: u8,
+    tile_max: u8,
+) -> (u8, u8) {
+    let declared_min = declared_min.unwrap_or(tile_min);
+    let declared_max = declared_max.unwrap_or(tile_max);
+    let minzoom = tile_min.min(declared_max).min(declared_min);
+    let maxzoom = tile_max.min(tile_min.max(declared_max).max(declared_min));
+    (minzoom, maxzoom)
+}
+
+/// apply [`reconciled_zoom_range`] to the tilejson's top-level zoom and to every
+/// vector layer.
+fn reconcile_zoom_levels(tj: &mut TileJSON, tile_min: u8, tile_max: u8) {
+    let (minzoom, maxzoom) = reconciled_zoom_range(tj.minzoom, tj.maxzoom, tile_min, tile_max);
+    tj.minzoom = Some(minzoom);
+    tj.maxzoom = Some(maxzoom);
+
+    if let Some(vector_layers) = tj.vector_layers.as_mut() {
+        for layer in vector_layers {
+            let (minzoom, maxzoom) =
+                reconciled_zoom_range(layer.minzoom, layer.maxzoom, tile_min, tile_max);
+            layer.minzoom = Some(minzoom);
+            layer.maxzoom = Some(maxzoom);
+        }
+    }
+}
+
 /// Create an in memory, temporary mbtile connection with the given `script`
 pub async fn anonymous_mbtiles(script: &str) -> (Mbtiles, SqliteConnection) {
     let mbt = Mbtiles::new(":memory:").expect("in-memory mbtiles can be created");
     let mut conn = mbt.open().await.expect("in-memory mbtiles can be opened");
-    sqlx::raw_sql(script)
+    sqlx::raw_sql(AssertSqlSafe(script))
         .execute(&mut conn)
         .await
         .expect("script execution succeeded");
@@ -359,7 +414,7 @@ pub async fn temp_named_mbtiles(
         .open()
         .await
         .unwrap_or_else(|_| panic!("can open connection to {}", file.display()));
-    sqlx::raw_sql(script)
+    sqlx::raw_sql(AssertSqlSafe(script))
         .execute(&mut conn)
         .await
         .unwrap_or_else(|_| panic!("can execute script on {}", file.display()));
@@ -427,8 +482,8 @@ mod tests {
         assert_eq!(
             tj.vector_layers,
             Some(vec![VectorLayer {
-                id: "cities".to_string(),
-                fields: vec![("name".to_string(), "String".to_string())]
+                id: "cities".to_owned(),
+                fields: vec![("name".to_owned(), "String".to_owned())]
                     .into_iter()
                     .collect(),
                 description: Some(String::new()),
@@ -438,7 +493,7 @@ mod tests {
             }])
         );
         assert_eq!(meta.id, ":memory:");
-        assert_eq!(meta.layer_type, Some("overlay".to_string()));
+        assert_eq!(meta.layer_type, Some("overlay".to_owned()));
     }
 
     #[actix_rt::test]
@@ -519,7 +574,9 @@ mod tests {
     async fn metadata_empty_tileset() {
         let mbt = Mbtiles::new(":memory:").unwrap();
         let mut conn = mbt.open().await.unwrap();
-        init_mbtiles_schema(&mut conn, MbtType::Flat).await.unwrap();
+        init_mbtiles_schema(&mut conn, MbtType::Flat, false)
+            .await
+            .unwrap();
 
         // get_metadata should work on empty tileset
         let meta = mbt.get_metadata(&mut conn).await;
@@ -528,5 +585,145 @@ mod tests {
         // detect_format should return None for empty tileset
         let tile_info = mbt.detect_format(&meta.tilejson, &mut conn).await.unwrap();
         assert_eq!(tile_info, None);
+    }
+
+    #[actix_rt::test]
+    async fn metadata_mlt() {
+        let script = include_str!("../../tests/fixtures/mbtiles/mlt.sql");
+        let (mbt, mut conn) = anonymous_mbtiles(script).await;
+        let meta = mbt.get_metadata(&mut conn).await.unwrap();
+        // compression=none must round-trip through tilejson.other
+        insta::assert_yaml_snapshot!(meta.tilejson.other, @r#"
+        compression: none
+        format: application/vnd.maplibre-vector-tile
+        "#);
+        let tile_info = mbt.detect_format(&meta.tilejson, &mut conn).await.unwrap();
+        assert_eq!(
+            tile_info,
+            Some(TileInfo::new(Format::Mlt, Encoding::Internal))
+        );
+    }
+
+    /// flat-schema in-memory mbtiles: the given `metadata` rows plus one dummy
+    /// tile at each of `tile_zooms`.
+    fn zoom_fixture_script(metadata: &[(&str, &str)], tile_zooms: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut script = String::from(
+            "CREATE TABLE metadata (name text NOT NULL PRIMARY KEY, value text);\n\
+             CREATE TABLE tiles (zoom_level integer, tile_column integer, tile_row integer, tile_data blob);\n",
+        );
+        for (name, value) in metadata {
+            let value = value.replace('\'', "''");
+            writeln!(script, "INSERT INTO metadata VALUES('{name}', '{value}');").unwrap();
+        }
+        for z in tile_zooms {
+            writeln!(script, "INSERT INTO tiles VALUES({z}, 0, 0, X'00');").unwrap();
+        }
+        script
+    }
+
+    #[actix_rt::test]
+    async fn metadata_zoom_clamps_overclaimed_maxzoom() {
+        // claims z14 but only ships z0-z2 -> maxzoom gets capped to 2.
+        let script = zoom_fixture_script(
+            &[
+                ("minzoom", "0"),
+                ("maxzoom", "14"),
+                (
+                    "json",
+                    r#"{"vector_layers":[{"id":"a","fields":{},"minzoom":0,"maxzoom":14}]}"#,
+                ),
+            ],
+            &[0, 1, 2],
+        );
+        let (mbt, mut conn) = anonymous_mbtiles(&script).await;
+        let meta = mbt.get_metadata(&mut conn).await.unwrap();
+        assert_eq!(meta.tilejson.minzoom, Some(0));
+        assert_eq!(meta.tilejson.maxzoom, Some(2));
+        let layers = meta.tilejson.vector_layers.unwrap();
+        assert_eq!(layers[0].minzoom, Some(0));
+        assert_eq!(layers[0].maxzoom, Some(2));
+    }
+
+    #[actix_rt::test]
+    async fn metadata_zoom_expands_to_lower_tiles() {
+        // says minzoom=2 but there are tiles down at z0 -> pull minzoom down so
+        // we don't hide them.
+        let script =
+            zoom_fixture_script(&[("minzoom", "2"), ("maxzoom", "5")], &[0, 1, 2, 3, 4, 5]);
+        let (mbt, mut conn) = anonymous_mbtiles(&script).await;
+        let meta = mbt.get_metadata(&mut conn).await.unwrap();
+        assert_eq!(meta.tilejson.minzoom, Some(0));
+        assert_eq!(meta.tilejson.maxzoom, Some(5));
+    }
+
+    #[actix_rt::test]
+    async fn metadata_zoom_populated_when_absent() {
+        // no zoom metadata at all -> derive it from the tiles.
+        let script = zoom_fixture_script(&[("name", "no-zoom")], &[2, 3]);
+        let (mbt, mut conn) = anonymous_mbtiles(&script).await;
+        let meta = mbt.get_metadata(&mut conn).await.unwrap();
+        assert_eq!(meta.tilejson.minzoom, Some(2));
+        assert_eq!(meta.tilejson.maxzoom, Some(3));
+    }
+
+    #[actix_rt::test]
+    async fn metadata_zoom_preserves_declared_min_within_range() {
+        // declares 0-6 but ships only a z6 tile -> minzoom stays 0 (we never
+        // raise it). same shape as the zoomed_world_cities fixture.
+        let script = zoom_fixture_script(&[("minzoom", "0"), ("maxzoom", "6")], &[6]);
+        let (mbt, mut conn) = anonymous_mbtiles(&script).await;
+        let meta = mbt.get_metadata(&mut conn).await.unwrap();
+        assert_eq!(meta.tilejson.minzoom, Some(0));
+        assert_eq!(meta.tilejson.maxzoom, Some(6));
+    }
+
+    #[actix_rt::test]
+    async fn metadata_zoom_untouched_without_tiles() {
+        // empty tileset -> nothing to reconcile against, leave metadata alone.
+        let script = zoom_fixture_script(&[("minzoom", "0"), ("maxzoom", "9")], &[]);
+        let (mbt, mut conn) = anonymous_mbtiles(&script).await;
+        let meta = mbt.get_metadata(&mut conn).await.unwrap();
+        assert_eq!(meta.tilejson.minzoom, Some(0));
+        assert_eq!(meta.tilejson.maxzoom, Some(9));
+    }
+
+    #[actix_rt::test]
+    async fn update_compression_gzip() {
+        let script = include_str!("../../tests/fixtures/mbtiles/world_cities.sql");
+        let (mbt, mut conn) = anonymous_mbtiles(script).await;
+
+        mbt.update_compression(&mut conn).await.unwrap();
+
+        let compression = mbt
+            .get_metadata_value(&mut conn, "compression")
+            .await
+            .unwrap();
+        assert_eq!(
+            compression.as_deref(),
+            Some("gzip"),
+            "world_cities tiles are gzip-compressed; compression metadata should be 'gzip'"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn update_compression_internal() {
+        let script = include_str!("../../tests/fixtures/mbtiles/geography-class-jpg.sql");
+        let (mbt, mut conn) = anonymous_mbtiles(script).await;
+
+        mbt.set_metadata_value(&mut conn, "compression", "gzip")
+            .await
+            .unwrap();
+
+        mbt.update_compression(&mut conn).await.unwrap();
+
+        assert_eq!(
+            mbt.get_metadata_value(&mut conn, "compression")
+                .await
+                .unwrap(),
+            None,
+            "JPEG tiles use internal compression; the compression metadata key should be absent"
+        );
     }
 }

@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use martin_tile_utils::{TileCoord, TileData, TileInfo};
 use tilejson::TileJSON;
 
+use crate::CacheZoomRange;
 use crate::tiles::catalog::CatalogSourceEntry;
+#[cfg(feature = "postgres")]
+use crate::tiles::postgres::ActiveQueryRegistry;
 use crate::tiles::{MartinCoreResult, Tile};
 
 /// URL query parameters for dynamic tile generation.
@@ -45,6 +48,17 @@ pub trait Source: Send + Sync + Debug {
         false
     }
 
+    /// Returnes the cancellation registry for queries
+    ///
+    /// Only works for postgresql sources for now
+    #[cfg(feature = "postgres")]
+    fn cancel_registry(&self) -> Option<ActiveQueryRegistry> {
+        None
+    }
+
+    /// Zoom-level bounds for tile caching.
+    fn cache_zoom(&self) -> CacheZoomRange;
+
     /// Retrieves tile data for the given coordinates.
     ///
     /// # Arguments
@@ -80,17 +94,31 @@ pub trait Source: Send + Sync + Debug {
             && tj.maxzoom.is_none_or(|maxzoom| zoom <= maxzoom)
     }
 
+    /// Attempts to create a fresh instance of this source.
+    ///
+    /// Sources that return a `MartinCoreError::SourceNeedReload` from `get_tile()` must also
+    /// implement this method.
+    ///
+    /// The default implementation asserts.
+    async fn try_reload(&self) -> MartinCoreResult<BoxedSource> {
+        unreachable!()
+    }
+
     /// Generates catalog entry for this source.
     fn get_catalog_entry(&self) -> CatalogSourceEntry {
         let id = self.get_id();
         let tilejson = self.get_tilejson();
         let info = self.get_tile_info();
         CatalogSourceEntry {
-            content_type: info.format.content_type().to_string(),
-            content_encoding: info.encoding.content_encoding().map(ToString::to_string),
+            content_type: info.format.content_type().to_owned(),
+            content_encoding: info.encoding.compression().map(str::to_owned),
             name: tilejson.name.as_ref().filter(|v| *v != id).cloned(),
             description: tilejson.description.clone(),
             attribution: tilejson.attribution.clone(),
+            // FIXME: surface `tilejson.vector_layers.len()` once we always have it.
+            layer_count: None,
+            // FIXME: surface the source's mtime (mbtiles/pmtiles modtime, etc.).
+            last_modified_at: None,
         }
     }
 }

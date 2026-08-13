@@ -5,17 +5,20 @@ use std::pin::Pin;
 
 use enum_display::EnumDisplay;
 use futures::Stream;
-use log::debug;
 use martin_tile_utils::{Tile, TileCoord};
 use serde::{Deserialize, Serialize};
 use sqlite_compressions::{register_bsdiffraw_functions, register_gzip_functions};
 use sqlite_hashes::register_md5_functions;
 use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{Connection as _, Executor, Row, SqliteConnection, SqliteExecutor, Statement, query};
+use sqlx::{
+    AssertSqlSafe, Connection as _, Executor as _, Row as _, SqliteConnection, SqliteExecutor,
+    Statement as _, query,
+};
+use tracing::debug;
 
 use crate::bindiff::PatchType;
 use crate::errors::{MbtError, MbtResult};
-use crate::{CopyDuplicateMode, MbtType, invert_y_value};
+use crate::{CopyDuplicateMode, MbtType, NormalizedSchema, invert_y_value};
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize, EnumDisplay)]
 #[enum_display(case = "Kebab")]
@@ -24,6 +27,7 @@ pub enum MbtTypeCli {
     Flat,
     FlatWithHash,
     Normalized,
+    Cache,
 }
 
 #[derive(Default, Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize, EnumDisplay)]
@@ -80,7 +84,7 @@ pub struct PatchFileInfo {
 /// ## Reading tiles from an existing file
 ///
 /// > [!NOTE]
-/// > Note that there are both [osgeos' Tile Map Service](https://wiki.openstreetmap.org/wiki/TMS) and [xyz Slippy map tilenames](https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames) tiling shemes.
+/// > Note that there are both [osgeos' Tile Map Service](https://wiki.openstreetmap.org/wiki/TMS) and [xyz Slippy map tilenames](https://wiki.openstreetmap.org/wiki/Slippy_map_tilenames) tiling schemes.
 /// > They differ only in if the y coordinate direction.
 /// > **The default in mapbox and maplibre is xyz.***
 /// > **The default in mbtiles generation like plantitler is tms.***
@@ -112,7 +116,7 @@ pub struct PatchFileInfo {
 /// let mut conn = mbt.open_or_new().await?;
 ///
 /// // Initialize with flat schema
-/// mbtiles::init_mbtiles_schema(&mut conn, MbtType::Flat).await?;
+/// mbtiles::init_mbtiles_schema(&mut conn, MbtType::Flat, false).await?;
 ///
 /// // Insert a batch of tiles
 /// let tiles = vec![
@@ -175,7 +179,7 @@ impl Mbtiles {
             filepath: path
                 .to_str()
                 .ok_or_else(|| MbtError::UnsupportedCharsInFilepath(path.to_path_buf()))?
-                .to_string(),
+                .to_owned(),
             filename: path
                 .file_stem()
                 .unwrap_or_else(|| OsStr::new("unknown"))
@@ -209,6 +213,7 @@ impl Mbtiles {
     /// # Ok(())
     /// # }
     /// ```
+    #[hotpath::measure]
     pub async fn open(&self) -> MbtResult<SqliteConnection> {
         debug!("Opening w/ defaults {self}");
         let opt = SqliteConnectOptions::new().filename(self.filepath());
@@ -236,10 +241,11 @@ impl Mbtiles {
     /// let mut conn = mbtiles.open_or_new().await?;
     ///
     /// // Initialize schema for a new file
-    /// mbtiles::init_mbtiles_schema(&mut conn, MbtType::Flat).await?;
+    /// mbtiles::init_mbtiles_schema(&mut conn, MbtType::Flat, false).await?;
     /// # Ok(())
     /// # }
     /// ```
+    #[hotpath::measure]
     pub async fn open_or_new(&self) -> MbtResult<SqliteConnection> {
         debug!("Opening or creating {self}");
         let opt = SqliteConnectOptions::new()
@@ -277,6 +283,7 @@ impl Mbtiles {
     /// # Ok(())
     /// # }
     /// ```
+    #[hotpath::measure]
     pub async fn open_readonly(&self) -> MbtResult<SqliteConnection> {
         debug!("Opening as readonly {self}");
         let opt = SqliteConnectOptions::new()
@@ -304,12 +311,13 @@ impl Mbtiles {
     }
 
     /// Attach this `MBTiles` file to the given `SQLite` connection as a given name
+    #[hotpath::measure]
     pub async fn attach_to<T>(&self, conn: &mut T, name: &str) -> MbtResult<()>
     where
         for<'e> &'e mut T: SqliteExecutor<'e>,
     {
         debug!("Attaching {self} as {name}");
-        query(&format!("ATTACH DATABASE ? AS {name}"))
+        query(AssertSqlSafe(format!("ATTACH DATABASE ? AS {name}")))
             .bind(self.filepath())
             .execute(conn)
             .await?;
@@ -334,7 +342,7 @@ impl Mbtiles {
     where
         &'e mut T: SqliteExecutor<'e>,
     {
-        use futures::StreamExt;
+        use futures::StreamExt as _;
 
         let query = query! {"SELECT zoom_level, tile_column, tile_row FROM tiles"};
         let stream = query.fetch(conn);
@@ -346,20 +354,17 @@ impl Mbtiles {
         let filepath = self.filepath.clone();
 
         Box::pin(stream.map(move |result| {
-            result.map_err(MbtError::from).and_then(|row| {
-                let z = row.zoom_level;
-                let x = row.tile_column;
-                let y = row.tile_row;
-                let coord = parse_tile_index(z, x, y).ok_or_else(|| {
-                    MbtError::InvalidTileIndex(
-                        filepath.clone(),
-                        format!("{z:?}"),
-                        format!("{x:?}"),
-                        format!("{y:?}"),
-                    )
-                })?;
-                Ok(coord)
-            })
+            let row = result.map_err(MbtError::from)?;
+            let z = row.zoom_level;
+            let x = row.tile_column;
+            let y = row.tile_row;
+            let coord = parse_tile_index(z, x, y).ok_or_else(|| MbtError::InvalidTileIndex {
+                filepath: filepath.clone(),
+                zoom_level: format!("{z:?}"),
+                tile_column: format!("{x:?}"),
+                tile_row: format!("{y:?}"),
+            })?;
+            Ok(coord)
         }))
     }
 
@@ -381,27 +386,24 @@ impl Mbtiles {
     where
         &'e mut T: SqliteExecutor<'e>,
     {
-        use futures::StreamExt;
+        use futures::StreamExt as _;
 
         let query = query! {"SELECT zoom_level, tile_column, tile_row, tile_data FROM tiles"};
         let stream = query.fetch(conn);
         let filepath = self.filepath.clone();
 
         Box::pin(stream.map(move |result| {
-            result.map_err(MbtError::from).and_then(|row| {
-                let z = row.zoom_level;
-                let x = row.tile_column;
-                let y = row.tile_row;
-                let coord = parse_tile_index(z, x, y).ok_or_else(|| {
-                    MbtError::InvalidTileIndex(
-                        filepath.clone(),
-                        format!("{z:?}"),
-                        format!("{x:?}"),
-                        format!("{y:?}"),
-                    )
-                })?;
-                Ok((coord, row.tile_data))
-            })
+            let row = result.map_err(MbtError::from)?;
+            let z = row.zoom_level;
+            let x = row.tile_column;
+            let y = row.tile_row;
+            let coord = parse_tile_index(z, x, y).ok_or_else(|| MbtError::InvalidTileIndex {
+                filepath: filepath.clone(),
+                zoom_level: format!("{z:?}"),
+                tile_column: format!("{x:?}"),
+                tile_row: format!("{y:?}"),
+            })?;
+            Ok((coord, row.tile_data))
         }))
     }
 
@@ -455,6 +457,7 @@ impl Mbtiles {
     /// # Ok(())
     /// # }
     /// ```
+    #[hotpath::measure]
     pub async fn get_tile<T>(
         &self,
         conn: &mut T,
@@ -465,8 +468,10 @@ impl Mbtiles {
     where
         for<'e> &'e mut T: SqliteExecutor<'e>,
     {
-        let y = invert_y_value(z, y);
-        let query = query! {"SELECT tile_data from tiles where zoom_level = ? AND tile_column = ? AND tile_row = ?", z, x, y};
+        let query = query! {
+            "SELECT tile_data from tiles where zoom_level = ? AND tile_column = ? AND tile_row = ?",
+            z, x, invert_y_value(z, y),
+        };
         let row = query.fetch_optional(conn).await?;
         if let Some(row) = row
             && let Some(tile_data) = row.tile_data
@@ -529,6 +534,7 @@ impl Mbtiles {
     /// # Ok(())
     /// # }
     /// ```
+    #[hotpath::measure]
     pub async fn get_tile_and_hash(
         &self,
         conn: &mut SqliteConnection,
@@ -559,11 +565,26 @@ impl Mbtiles {
             MbtType::Flat => {
                 "SELECT tile_data, NULL as tile_hash from tiles where zoom_level = ? AND tile_column = ? AND tile_row = ?"
             }
-            MbtType::FlatWithHash | MbtType::Normalized { hash_view: true } => {
+            MbtType::FlatWithHash
+            | MbtType::Normalized {
+                hash_view: true, ..
+            } => {
                 "SELECT tile_data, tile_hash from tiles_with_hash where zoom_level = ? AND tile_column = ? AND tile_row = ?"
             }
-            MbtType::Normalized { hash_view: false } => {
+            MbtType::Normalized {
+                hash_view: false,
+                schema: NormalizedSchema::Hash,
+            } => {
                 "SELECT images.tile_data, images.tile_id AS tile_hash FROM map JOIN images ON map.tile_id = images.tile_id  where map.zoom_level = ? AND map.tile_column = ? AND map.tile_row = ?"
+            }
+            MbtType::Normalized {
+                hash_view: false,
+                schema: NormalizedSchema::DedupId,
+            } => {
+                "SELECT tiles_data.tile_data, NULL AS tile_hash FROM tiles_shallow JOIN tiles_data ON tiles_shallow.tile_data_id = tiles_data.tile_data_id  where tiles_shallow.zoom_level = ? AND tiles_shallow.tile_column = ? AND tiles_shallow.tile_row = ?"
+            }
+            MbtType::Cache => {
+                "SELECT tile_data, NULL AS tile_hash from tile_cache where zoom_level = ? AND tile_column = ? AND tile_row = ?"
             }
         }
     }
@@ -589,33 +610,37 @@ impl Mbtiles {
     /// mbtiles.insert_tiles(&mut conn, mbt_type, CopyDuplicateMode::Ignore, &batch).await.unwrap();
     /// # }
     /// ```
-    pub async fn insert_tiles(
+    #[hotpath::measure]
+    pub async fn insert_tiles<D: AsRef<[u8]>>(
         &self,
         conn: &mut SqliteConnection,
         mbt_type: MbtType,
         on_duplicate: CopyDuplicateMode,
-        batch: &[(u8, u32, u32, Vec<u8>)],
+        batch: &[(u8, u32, u32, D)],
     ) -> MbtResult<()> {
         debug!(
             "Inserting a batch of {} tiles into {mbt_type} / {on_duplicate}",
             batch.len()
         );
+        let to_sql_str = |sql: String| sqlx::SqlSafeStr::into_sql_str(AssertSqlSafe(sql));
         let mut tx = conn.begin().await?;
         let (sql1, sql2) = Self::get_insert_sql(mbt_type, on_duplicate);
         if let Some(sql2) = sql2 {
-            let sql2 = tx.prepare(&sql2).await?;
+            let sql2 = tx.prepare(to_sql_str(sql2)).await?;
             for (_, _, _, tile_data) in batch {
-                sql2.query().bind(tile_data).execute(&mut *tx).await?;
+                sql2.query()
+                    .bind(tile_data.as_ref())
+                    .execute(&mut *tx)
+                    .await?;
             }
         }
-        let sql1 = tx.prepare(&sql1).await?;
+        let sql1 = tx.prepare(to_sql_str(sql1)).await?;
         for (z, x, y, tile_data) in batch {
-            let y = invert_y_value(*z, *y);
             sql1.query()
                 .bind(z)
                 .bind(x)
-                .bind(y)
-                .bind(tile_data)
+                .bind(invert_y_value(*z, *y))
+                .bind(tile_data.as_ref())
                 .execute(&mut *tx)
                 .await?;
         }
@@ -628,6 +653,7 @@ impl Mbtiles {
     /// This method is slightly faster than [`Mbtiles::get_tile_and_hash`] and [`Mbtiles::get_tile`]
     /// because it only checks if the tile exists but does not retrieve tile data.
     /// Most of the time you would want to use the other two functions.
+    #[hotpath::measure]
     pub async fn contains(
         &self,
         conn: &mut SqliteConnection,
@@ -639,12 +665,13 @@ impl Mbtiles {
         let table = match mbt_type {
             MbtType::Flat => "tiles",
             MbtType::FlatWithHash => "tiles_with_hash",
-            MbtType::Normalized { .. } => "map",
+            MbtType::Normalized { schema, .. } => schema.map_table(),
+            MbtType::Cache => "tile_cache",
         };
         let sql = format!(
             "SELECT 1 from {table} where zoom_level = ? AND tile_column = ? AND tile_row = ?"
         );
-        let row = query(&sql)
+        let row = query(AssertSqlSafe(sql))
             .bind(z)
             .bind(x)
             .bind(invert_y_value(z, y))
@@ -687,6 +714,15 @@ impl Mbtiles {
     VALUES (md5_hex(?1), ?1);"
                 )),
             ),
+            // Bulk-inserted cache entries get NULL fetched/expires/etag (unknown fetch time, never expire)
+            MbtType::Cache => (
+                format!(
+                    "
+    INSERT {on_duplicate} INTO tile_cache (zoom_level, tile_column, tile_row, tile_data)
+    VALUES (?1, ?2, ?3, ?4);"
+                ),
+                None,
+            ),
         }
     }
 }
@@ -703,7 +739,11 @@ pub async fn attach_sqlite_fn(conn: &mut SqliteConnection) -> MbtResult<()> {
     Ok(())
 }
 
-fn parse_tile_index(z: Option<i64>, x: Option<i64>, y: Option<i64>) -> Option<TileCoord> {
+pub(crate) fn parse_tile_index(
+    z: Option<i64>,
+    x: Option<i64>,
+    y: Option<i64>,
+) -> Option<TileCoord> {
     let z: u8 = z?.try_into().ok()?;
     let x: u32 = x?.try_into().ok()?;
     let y: u32 = y?.try_into().ok()?;

@@ -7,8 +7,10 @@ listen_addresses: '0.0.0.0:3000'
 # Number of web server workers
 worker_processes: 8
 
-# Amount of memory (in MB) to use for caching tiles [default: 512, 0 to disable]
-cache_size_mb: 512
+# Cache configuration
+cache:
+  # Amount of memory (in MB) to use for caching [default: 512, 0 to disable]
+  size_mb: 512
 
 # see https://maplibre.org/martin/config-file.html
 
@@ -34,6 +36,13 @@ cache_size_mb: 512
 #     - /path/to/mbtiles.mbtiles
 #   sources:
 #     mb-src1: /path/to/mbtiles1.mbtiles
+
+# geojson:
+#   paths:
+#    - /dir-path
+#     - /path/to/geojson.geojson
+#   sources:
+#     geo-src1: /path/to/geojson1.geojson
 
 # sprites:
 #   paths:

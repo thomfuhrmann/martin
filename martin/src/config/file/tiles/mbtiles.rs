@@ -1,3 +1,4 @@
+use crate::config::file::CollectUnrecognizedKeys;
 use std::fmt::Debug;
 use std::path::PathBuf;
 
@@ -8,30 +9,60 @@ use url::Url;
 
 use crate::MartinResult;
 use crate::config::file::{
-    ConfigurationLivecycleHooks, TileSourceConfiguration, UnrecognizedKeys, UnrecognizedValues,
+    CachePolicy, ConfigurationLivecycleHooks, TileSourceConfiguration, UnrecognizedValues,
 };
+#[cfg(all(feature = "mlt", feature = "_tiles"))]
+use crate::config::file::{MltProcessConfig, MvtProcessConfig};
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde_with::skip_serializing_none]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    CollectUnrecognizedKeys,
+    ConfigurationLivecycleHooks,
+)]
+#[cfg_attr(feature = "unstable-schemas", derive(schemars::JsonSchema))]
 pub struct MbtConfig {
-    #[serde(flatten, skip_serializing)]
-    pub unrecognized: UnrecognizedValues,
-}
+    /// MVT->MLT encoder settings for all `MBTiles` sources.
+    /// Overrides global; overridden by per-source `convert_to_mlt`.
+    #[cfg(all(feature = "mlt", feature = "_tiles"))]
+    #[serde(default)]
+    pub convert_to_mlt: Option<MltProcessConfig>,
 
-impl ConfigurationLivecycleHooks for MbtConfig {
-    fn get_unrecognized_keys(&self) -> UnrecognizedKeys {
-        self.unrecognized.keys().cloned().collect()
-    }
+    /// MLT->MVT conversion settings for all `MBTiles` sources.
+    /// Overrides global; overridden by per-source `convert_to_mvt`.
+    #[cfg(all(feature = "mlt", feature = "_tiles"))]
+    #[serde(default)]
+    pub convert_to_mvt: Option<MvtProcessConfig>,
+
+    #[serde(flatten, skip_serializing)]
+    #[cfg_attr(feature = "unstable-schemas", schemars(skip))]
+    pub unrecognized: UnrecognizedValues,
 }
 
 impl TileSourceConfiguration for MbtConfig {
     fn parse_urls() -> bool {
         false
     }
-    async fn new_sources(&self, id: String, path: PathBuf) -> MartinResult<BoxedSource> {
-        Ok(Box::new(MbtSource::new(id, path).await?))
+    async fn new_sources(
+        &self,
+        id: String,
+        path: PathBuf,
+        cache: CachePolicy,
+    ) -> MartinResult<BoxedSource> {
+        Ok(Box::new(MbtSource::new(id, path, cache.zoom()).await?))
     }
 
-    async fn new_sources_url(&self, _id: String, _url: Url) -> MartinResult<BoxedSource> {
+    async fn new_sources_url(
+        &self,
+        _id: String,
+        _url: Url,
+        _cache: CachePolicy,
+    ) -> MartinResult<BoxedSource> {
         unreachable!()
     }
 }
@@ -42,15 +73,19 @@ mod tests {
     use std::path::PathBuf;
 
     use indoc::indoc;
+    use martin_core::CacheZoomRange;
+
+    use crate::config::file::CollectUnrecognizedKeys as _;
 
     use crate::config::file::mbtiles::MbtConfig;
     use crate::config::file::{
-        ConfigurationLivecycleHooks, FileConfigEnum, FileConfigSource, FileConfigSrc,
+        CachePolicy, ConfigurationLivecycleHooks as _, FileConfigEnum, FileConfigSource,
+        FileConfigSrc,
     };
 
-    #[test]
-    fn parse() {
-        let mut cfg = serde_yaml::from_str::<FileConfigEnum<MbtConfig>>(indoc! {"
+    #[tokio::test]
+    async fn parse() {
+        let mut cfg = serde_saphyr::from_str::<FileConfigEnum<MbtConfig>>(indoc! {"
             paths:
               - /dir-path
               - /path/to/file2.ext
@@ -62,9 +97,14 @@ mod tests {
                 pm-src3: https://example.org/file3.ext
                 pm-src4:
                   path: https://example.org/file4.ext
+                pm-src5:
+                  path: /tmp/cached.ext
+                  cache:
+                    minzoom: 0
+                    maxzoom: 6
         "})
         .unwrap();
-        cfg.finalize().unwrap();
+        cfg.finalize().await.unwrap();
         let unrecognised = cfg.get_unrecognized_keys();
         assert!(
             unrecognised.is_empty(),
@@ -86,23 +126,44 @@ mod tests {
             cfg.sources,
             Some(BTreeMap::from_iter(vec![
                 (
-                    "pm-src1".to_string(),
+                    "pm-src1".to_owned(),
                     FileConfigSrc::Path(PathBuf::from("/tmp/file.ext"))
                 ),
                 (
-                    "pm-src2".to_string(),
+                    "pm-src2".to_owned(),
                     FileConfigSrc::Obj(FileConfigSource {
                         path: PathBuf::from("/tmp/file.ext"),
+                        #[cfg(all(feature = "mlt", feature = "_tiles"))]
+                        convert_to_mlt: None,
+                        #[cfg(all(feature = "mlt", feature = "_tiles"))]
+                        convert_to_mvt: None,
+                        cache: CachePolicy::default(),
                     })
                 ),
                 (
-                    "pm-src3".to_string(),
+                    "pm-src3".to_owned(),
                     FileConfigSrc::Path(PathBuf::from("https://example.org/file3.ext"))
                 ),
                 (
-                    "pm-src4".to_string(),
+                    "pm-src4".to_owned(),
                     FileConfigSrc::Obj(FileConfigSource {
                         path: PathBuf::from("https://example.org/file4.ext"),
+                        #[cfg(all(feature = "mlt", feature = "_tiles"))]
+                        convert_to_mlt: None,
+                        #[cfg(all(feature = "mlt", feature = "_tiles"))]
+                        convert_to_mvt: None,
+                        cache: CachePolicy::default(),
+                    })
+                ),
+                (
+                    "pm-src5".to_owned(),
+                    FileConfigSrc::Obj(FileConfigSource {
+                        path: PathBuf::from("/tmp/cached.ext"),
+                        #[cfg(all(feature = "mlt", feature = "_tiles"))]
+                        convert_to_mlt: None,
+                        #[cfg(all(feature = "mlt", feature = "_tiles"))]
+                        convert_to_mvt: None,
+                        cache: CachePolicy::new(CacheZoomRange::new(Some(0), Some(6))),
                     })
                 ),
             ]))

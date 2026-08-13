@@ -1,3 +1,4 @@
+use crate::config::file::CollectUnrecognizedKeys;
 use std::collections::BTreeMap;
 
 use martin_core::sprites::SpriteSources;
@@ -5,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::config::file::{
-    ConfigFileResult, ConfigurationLivecycleHooks, FileConfigEnum, UnrecognizedKeys,
+    CacheSizeConfig, ConfigFileResult, ConfigurationLivecycleHooks, FileConfigEnum,
     UnrecognizedValues,
 };
 
@@ -39,26 +40,35 @@ impl SpriteConfig {
             results.add_source(name.to_string_lossy().to_string(), path);
         }
 
-        *self = FileConfigEnum::new_extended(directories, configs, cfg.custom);
+        *self = Self::new_extended(directories, configs, cfg.custom);
 
         Ok(results)
     }
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    CollectUnrecognizedKeys,
+    ConfigurationLivecycleHooks,
+)]
+#[cfg_attr(feature = "unstable-schemas", derive(schemars::JsonSchema))]
 pub struct InnerSpriteConfig {
-    /// Size of the sprite cache in megabytes (0 to disable)
-    ///
-    /// Overrides [`cache_size_mb`](crate::config::file::Config::cache_size_mb).
-    pub cache_size_mb: Option<u64>,
+    /// Cache configuration for sprites.
+    /// Use `cache: disable` to disable sprite caching.
+    #[serde(default, skip_serializing_if = "CacheSizeConfig::is_empty")]
+    #[cfg_attr(
+        feature = "unstable-schemas",
+        schemars(with = "crate::config::file::CacheSizeConfigShape")
+    )]
+    pub cache: CacheSizeConfig,
 
     #[serde(flatten, skip_serializing)]
+    #[cfg_attr(feature = "unstable-schemas", schemars(skip))]
     pub unrecognized: UnrecognizedValues,
-}
-
-impl ConfigurationLivecycleHooks for InnerSpriteConfig {
-    fn get_unrecognized_keys(&self) -> UnrecognizedKeys {
-        self.unrecognized.keys().cloned().collect()
-    }
 }

@@ -4,11 +4,13 @@ use std::io;
 use std::path::PathBuf;
 
 use deadpool_postgres::tokio_postgres::Error as TokioPostgresError;
+use deadpool_postgres::tokio_postgres::config::SslMode;
 use deadpool_postgres::{BuildError, PoolError};
 use martin_tile_utils::TileCoord;
 use semver::Version;
 
 use crate::tiles::UrlQuery;
+use crate::tiles::postgres::RedactedConnectionString;
 use crate::tiles::postgres::utils::query_to_json;
 
 /// Result type for `PostgreSQL` operations.
@@ -35,16 +37,28 @@ pub enum PostgresError {
     InvalidPrivateKey(PathBuf),
 
     /// Cannot use client certificate pair.
-    #[error("Unable to use client certificate pair {1} / {2}: {0}")]
-    CannotUseClientKey(#[source] rustls::Error, PathBuf, PathBuf),
+    #[error("Unable to use client certificate pair {cert} / {key}: {source}")]
+    CannotUseClientKey {
+        /// The underlying `rustls` error.
+        #[source]
+        source: rustls::Error,
+        /// Path to the client certificate file.
+        cert: PathBuf,
+        /// Path to the client private key file.
+        key: PathBuf,
+    },
 
     /// Wrapper for rustls errors.
     #[error(transparent)]
     RustlsError(#[from] rustls::Error),
 
+    /// Cannot build the TLS certificate verifier.
+    #[error(transparent)]
+    CannotBuildTlsVerifier(#[from] rustls::client::VerifierBuilderError),
+
     /// Unknown SSL mode specified.
     #[error("Unknown SSL mode: {0:?}")]
-    UnknownSslMode(deadpool_postgres::tokio_postgres::config::SslMode),
+    UnknownSslMode(SslMode),
 
     /// `PostgreSQL` database error.
     #[error("Postgres error while {1}: {0}")]
@@ -60,31 +74,50 @@ pub enum PostgresError {
 
     /// Invalid `PostgreSQL` connection string.
     #[error("Unable to parse connection string {1}: {0}")]
-    BadConnectionString(#[source] TokioPostgresError, String),
+    BadConnectionString(#[source] TokioPostgresError, RedactedConnectionString),
 
     /// Cannot parse `PostGIS` version.
     #[error("Unable to parse PostGIS version {1}: {0}")]
     BadPostgisVersion(#[source] semver::Error, String),
 
     /// Cannot parse `PostgreSQL` version.
-    #[error("Unable to parse PostgreSQL version {1}: {0}")]
-    BadPostgresVersion(#[source] semver::Error, String),
+    #[error("Unable to parse PostgreSQL version {version_num}")]
+    BadPostgresVersion {
+        /// The `server_version_num` setting reported by the server.
+        version_num: i32,
+    },
 
     /// `PostGIS` version too old.
-    #[error("PostGIS version {0} is too old, minimum required is {1}")]
-    PostgisTooOld(Version, Version),
+    #[error("PostGIS version {current} is too old, minimum required is {minimum}")]
+    PostgisTooOld {
+        /// The detected `PostGIS` version.
+        current: Version,
+        /// The minimum required `PostGIS` version.
+        minimum: Version,
+    },
 
     /// `PostgreSQL` version too old.
-    #[error("PostgreSQL version {0} is too old, minimum required is {1}")]
-    PostgresqlTooOld(Version, Version),
-
-    /// Invalid table extent configuration.
-    #[error("Invalid extent setting in source {0} for table {1}: extent=0")]
-    InvalidTableExtent(String, String),
+    #[error("PostgreSQL version {current} is too old, minimum required is {minimum}")]
+    PostgresqlTooOld {
+        /// The detected `PostgreSQL` version.
+        current: Version,
+        /// The minimum required `PostgreSQL` version.
+        minimum: Version,
+    },
 
     /// Query preparation error.
-    #[error("Error preparing a query for the tile '{1}' ({2}): {3} {0}")]
-    PrepareQueryError(#[source] TokioPostgresError, String, String, String),
+    #[error("Error preparing a query for the tile '{source_id}' ({signature}): {query} {source}")]
+    PrepareQueryError {
+        /// The underlying `PostgreSQL` error.
+        #[source]
+        source: TokioPostgresError,
+        /// The id of the tile source the query was prepared for.
+        source_id: String,
+        /// The source's query signature (parameter types).
+        signature: String,
+        /// The SQL query that failed to prepare.
+        query: String,
+    },
 
     /// Tile retrieval error.
     #[error(r"Unable to get tile {2:#} from {1}: {0}")]
