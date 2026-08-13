@@ -59,7 +59,7 @@ impl TileSourceConfiguration for ZarrConfig {
     }
 
     async fn new_sources(&self, id: String, path: PathBuf) -> MartinResult<BoxedSource> {
-        let zarr_source = ZarrSource::new(id, path)?;
+        let zarr_source = ZarrSource::async_new(id, path).await?;
         Ok(Box::new(zarr_source))
     }
 

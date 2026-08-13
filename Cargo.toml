@@ -242,7 +242,8 @@ utoipa = { version = "5.4", default-features = false, features = [
 walkdir = "2.5.0"
 wiremock = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-zarrs = "0.23.13"
+zarrs = { version = "0.23.13", features = ["async"] }
+zarrs_object_store = "0.7.0"
 zstd = "0.13"
 
 [profile.dev.package]

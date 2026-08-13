@@ -10,11 +10,8 @@ pub enum ZarrError {
     #[error("IO error {0}: {1}")]
     IoError(#[source] std::io::Error, PathBuf),
     /// Filesystem create error
-    #[error("Filesystem create error {0}: {1}")]
-    FilesystemStoreCreateError(
-        #[source] zarrs::filesystem::FilesystemStoreCreateError,
-        PathBuf,
-    ),
+    #[error("Object store create error {0}: {1}")]
+    OjbectStoreError(#[source] object_store::Error, PathBuf),
     /// Zarr array error
     #[error("Zarr array error: {0}")]
     ArrayError(#[source] zarrs::array::ArrayError),

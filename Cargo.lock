@@ -746,6 +746,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-generic"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddf3728566eefa873833159754f5732fb0951d3649e6e5b891cc70d56dd41673"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "async-lock"
 version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5372,6 +5383,7 @@ dependencies = [
  "wiremock",
  "xxhash-rust",
  "zarrs",
+ "zarrs_object_store",
  "zstd",
 ]
 
@@ -10810,7 +10822,9 @@ version = "0.23.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8132307b8fc041fd21f68c7987103fb6e038b11f9838c16ec43b798f5480ccf5"
 dependencies = [
+ "async-generic",
  "async-lock",
+ "async-trait",
  "base64 0.22.1",
  "blosc-src",
  "blusc",
@@ -10819,6 +10833,7 @@ dependencies = [
  "crc32c",
  "derive_more 2.1.1",
  "flate2",
+ "futures",
  "getrandom 0.3.4",
  "half",
  "inventory",
@@ -10971,6 +10986,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zarrs_object_store"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f39632e2ce9e862f81e45ae3526ae70cb2ceb4ae0e24e9580d85441e75f16a43"
+dependencies = [
+ "async-trait",
+ "futures",
+ "object_store",
+ "zarrs_storage",
+]
+
+[[package]]
 name = "zarrs_plugin"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10988,9 +11015,11 @@ version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13f043c9bd3de69637574f7a2c4b3450f8e310d650fe5c2a78a08d13095cbf9"
 dependencies = [
+ "async-trait",
  "auto_impl",
  "bytes",
  "derive_more 2.1.1",
+ "futures",
  "itertools 0.14.0",
  "thiserror 2.0.19",
  "unsafe_cell_slice",

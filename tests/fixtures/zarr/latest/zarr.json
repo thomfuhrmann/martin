@@ -1,0 +1,47 @@
+{
+  "attributes": {
+    "zarr_conventions": [
+      {
+        "uuid": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
+        "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v1/schema.json",
+        "spec_url": "https://github.com/zarr-conventions/spatial/blob/v1/README.md",
+        "name": "spatial:",
+        "description": "Spatial coordinate information"
+      },
+      {
+        "uuid": "f17cb550-5864-4468-aeb7-f3180cfb622f",
+        "schema_url": "https://raw.githubusercontent.com/zarr-experimental/geo-proj/refs/tags/v1/schema.json",
+        "spec_url": "https://github.com/zarr-experimental/geo-proj/blob/v1/README.md",
+        "name": "proj:",
+        "description": "Coordinate reference system information for geospatial data"
+      }
+    ],
+    "spatial:dimensions": [
+      "y",
+      "x"
+    ],
+    "spatial:bbox": [
+      19500.0,
+      189500.0,
+      720500.0,
+      620500.0
+    ],
+    "spatial:transform_type": "affine",
+    "spatial:transform": [
+      1000.0,
+      0.0,
+      19500.0,
+      0.0,
+      -1000.0,
+      620500.0
+    ],
+    "spatial:shape": [
+      431,
+      701
+    ],
+    "spatial:registration": "pixel",
+    "proj:code": "EPSG:31287"
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}

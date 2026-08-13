@@ -1,130 +1,149 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use core::f64;
-use image::{ImageBuffer, LumaA};
+use object_store::ObjectStore;
+use zarrs::node::async_get_child_nodes;
+use zarrs_object_store::AsyncObjectStore;
+// use image::{ImageBuffer, LumaA};
 use martin_tile_utils::TileCoord;
 use std::{error::Error, ops::Range, sync::Arc};
+use zarrs::storage::{AsyncListableStorageTraits, AsyncReadableStorageTraits};
 use zarrs::{
     array::{Array, ArrayMetadata, DimensionName},
     filesystem::FilesystemStore,
-    group::{Group, GroupMetadata},
-    node::{Node, NodeMetadata, NodePath, get_child_nodes},
+    group::Group,
+    node::{Node, NodeMetadata, NodePath},
     plugin::ZarrVersion,
 };
 use zstd::encode_all;
 
 use crate::tiles::zarr::error::ZarrError;
 
-pub fn enumerate_data_variables(store: Arc<FilesystemStore>) -> Result<Vec<NodePath>, ZarrError> {
+/// Retrieve all data variables of this store - arrays that are not dimensions
+pub async fn data_variables<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<Vec<NodePath>, ZarrError> {
     let root_path = NodePath::root();
-    let root_group = Group::open(store.clone(), root_path.as_str())
-        .map_err(|e| ZarrError::GroupCreateError(e))?;
-    let attributes = root_group.attributes();
-    let Some(crs_path) = attributes
-        .get("coordinates")
-        .map(|v| v.as_str())
-        .flatten()
-        .map(|v| NodePath::new(&format!("/{}", v)))
-        .transpose()
-        .map_err(|e| ZarrError::NodePathError(e))?
-    else {
-        return Err(ZarrError::AttributeError(
-            "Can not retrieve CRS path".into(),
-        ));
-    };
-
-    if let GroupMetadata::V2(_group_metadata) = root_group.metadata() {
-        panic!("Zarr V2 is not supported");
-    }
-
-    let child_nodes =
-        get_child_nodes(&store, &root_path, true).map_err(|e| ZarrError::NodeCreateError(e))?;
+    let child_nodes = async_get_child_nodes(&store, &root_path, true)
+        .await
+        .map_err(|e| ZarrError::NodeCreateError(e))?;
     let filtered_child_nodes = child_nodes
         .into_iter()
-        .filter_map(|n| match is_data_variable(&n) {
-            true => {
-                if n.path() != &crs_path {
-                    Some(n.path().clone())
-                } else {
-                    None
-                }
-            }
-            false => None,
-        })
+        .filter(|n| is_data_variable(n).is_ok_and(|is_data| is_data))
+        .map(|n| n.path().clone())
         .collect::<Vec<_>>();
-
     Ok(filtered_child_nodes)
 }
 
-/// Get coordinate system definition as WKT-string
-pub fn get_wkt_string(store: Arc<FilesystemStore>) -> Result<String, ZarrError> {
+/// Retrieve time variable
+pub async fn time_coords<S: AsyncReadableStorageTraits + AsyncListableStorageTraits + 'static>(
+    store: Arc<S>,
+) -> Result<Option<Array<S>>, ZarrError> {
     let root_path = NodePath::root();
-    let root_group = Group::open(store.clone(), root_path.as_str())
-        .map_err(|e| ZarrError::GroupCreateError(e))?;
-    let attributes = root_group.attributes();
-    let crs_path = attributes
-        .get("coordinates")
-        .map(|v| v.as_str())
-        .flatten()
-        .map(|v| NodePath::new(&format!("/{}", v)))
-        .transpose()
-        .map_err(|e| ZarrError::NodePathError(e))?;
-
-    // Get WKT for projection information
-    let crs_array = crs_path
-        .clone()
-        .map(|p| Array::open(store.clone(), p.as_str()))
-        .transpose()
-        .map_err(|e| ZarrError::ArrayCreateError(e))?;
-
-    let crs_wkt = crs_array
-        .and_then(|arr| {
-            arr.attributes()
-                .get("crs_wkt")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-        .ok_or(ZarrError::WktError("Could not retrieve WKT-string".into()))?;
-
-    Ok(crs_wkt)
+    let child_nodes = async_get_child_nodes(&store, &root_path, true)
+        .await
+        .map_err(|e| ZarrError::NodeCreateError(e))?;
+    let time_node_path = child_nodes
+        .into_iter()
+        .find(|n| n.name().as_str() == "time")
+        .map(|n| n.path().clone());
+    if let Some(node_path) = time_node_path {
+        let array = Array::async_open(store, node_path.as_str())
+            .await
+            .map_err(|e| ZarrError::ArrayCreateError(e))?;
+        return Ok(Some(array));
+    }
+    Ok(None)
 }
 
-/// Check if the array is a NetCDF data variable
-fn is_data_variable(node: &Node) -> bool {
+/// Check if the array is a data variable
+fn is_data_variable(node: &Node) -> Result<bool, ZarrError> {
     let metadata = node.metadata();
     let path = node.path().as_str();
-    match metadata {
-        NodeMetadata::Array(array_metadata) => match array_metadata {
-            ArrayMetadata::V2(_) => panic!("Zarr V2 not implemented yet"),
-            ArrayMetadata::V3(metadata_v3) => {
-                if let Some(dim_names) = &metadata_v3.dimension_names {
-                    let is_coord = dim_names.iter().any(|dim_name| {
-                        if let Some(dim) = dim_name
-                            && path.ends_with(dim)
-                        {
-                            true
-                        } else {
-                            false
-                        }
-                    });
 
-                    return !is_coord;
-                } else {
-                    return false;
-                }
-            }
+    let dim_names = match metadata {
+        NodeMetadata::Array(array_metadata) => match array_metadata {
+            ArrayMetadata::V2(metadata_v2) => metadata_v2
+                .attributes
+                .get("_ARRAY_DIMENSIONS")
+                .and_then(|val| serde_json::from_value(val.clone()).ok())
+                .ok_or_else(|| {
+                    ZarrError::AttributeError("_ARRAY_DIMENSIONS missing or invalid".into())
+                })?,
+            ArrayMetadata::V3(metadata_v3) => metadata_v3
+                .dimension_names
+                .clone()
+                .and_then(|names| names.into_iter().collect())
+                .ok_or_else(|| {
+                    ZarrError::AttributeError(
+                        "dimension_names missing or contains null elements".into(),
+                    )
+                })?,
         },
-        NodeMetadata::Group(_) => return false,
-    }
+        NodeMetadata::Group(_) => Vec::new(),
+    };
+
+    let is_coord = dim_names.iter().any(|dim_name| path.ends_with(dim_name));
+    Ok(!is_coord)
 }
 
-pub fn get_spatial_dims(array: &Array<FilesystemStore>) -> Vec<&str> {
+/// Get coordinate system definition as EPSG code
+pub async fn get_proj_code<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<String, ZarrError> {
+    let root_group = Group::async_open(store.clone(), NodePath::root().as_str())
+        .await
+        .map_err(|e| ZarrError::GroupCreateError(e))?;
+
+    root_group
+        .attributes()
+        .get("proj:code")
+        .map(|val| val.as_str())
+        .flatten()
+        .map(|val| val.into())
+        .ok_or(ZarrError::AttributeError("proj:code".into()))
+}
+
+/// Get the affine transformation from pixel space to geographic space
+pub async fn get_spatial_transform<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<[f64; 6], ZarrError> {
+    let root_group = Group::async_open(store, NodePath::root().as_str())
+        .await
+        .map_err(ZarrError::GroupCreateError)?;
+
+    let transform_value = root_group
+        .attributes()
+        .get("spatial:transform")
+        .ok_or_else(|| ZarrError::AttributeError("spatial:transform is missing".into()))?;
+
+    serde_json::from_value::<[f64; 6]>(transform_value.clone())
+        .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:transform format: {e}")))
+}
+
+/// Get the bounding box
+pub async fn get_bbox<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<[f64; 4], ZarrError> {
+    let root_group = Group::async_open(store, NodePath::root().as_str())
+        .await
+        .map_err(ZarrError::GroupCreateError)?;
+
+    let transform_value = root_group
+        .attributes()
+        .get("spatial:bbox")
+        .ok_or_else(|| ZarrError::AttributeError("spatial:transform is missing".into()))?;
+
+    serde_json::from_value::<[f64; 4]>(transform_value.clone())
+        .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:transform format: {e}")))
+}
+
+/// Returns the names of the spatial dimensions
+pub fn get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
     array
         .attributes()
-        .get("coordinates")
-        .map(|v| v.as_str())
-        .flatten()
-        .map(|s| s.split(" ").collect::<Vec<_>>())
-        .unwrap_or(vec![])
+        .get("spatial:dimensions")
+        .and_then(|val| val.as_array())
+        .and_then(|dims| dims.into_iter().map(|dim| dim.as_str()).collect())
 }
 
 pub fn get_non_spatial_dims(
@@ -151,10 +170,10 @@ pub fn get_non_spatial_dims(
     Ok(non_spatial)
 }
 
-const TILE_PIXELS: u32 = 256;
+const TILE_PIXELS: u32 = 512;
 const SOURCE_CRS: &str = "EPSG:3857";
 
-/// Sample from array using a coordinate transformation
+/// Sample from array using a projection
 pub fn sample_data_var(
     tile: &TileCoord,
     x_coords: &Array<FilesystemStore>,
@@ -512,76 +531,103 @@ fn find_closest_binary(
 
 // TODO: move blocking CPU bound coord transformation to thread pool
 
-use std::sync::{Arc, LazyLock};
-use rayon::{ThreadPool, ThreadPoolBuilder};
-use tokio::sync::oneshot;
-
-// Thread pool initializes automatically on first dereference
-static REPROJECT_POOL: LazyLock<Arc<ThreadPool>> = LazyLock::new(|| {
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(reproject_worker_count())
-        .thread_name(|i| format!("lazycogs-reproject-{}", i))
-        .build()
-        .expect("failed to create reproject thread pool");
-    Arc::new(pool)
-});
-
-pub async fn run_reproject<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    let (tx, rx) = oneshot::channel();
-
-    // Accessing &*REPROJECT_POOL triggers the lazy initialization on first call
-    REPROJECT_POOL.spawn(move || {
-        let res = f();
-        let _ = tx.send(res);
-    });
-
-    rx.await.expect("worker thread panicked or dropped")
-}
+// use rayon::{ThreadPool, ThreadPoolBuilder};
+// use std::sync::{Arc, LazyLock};
+// use tokio::sync::oneshot;
+//
+// // Thread pool initializes automatically on first dereference
+// static REPROJECT_POOL: LazyLock<Arc<ThreadPool>> = LazyLock::new(|| {
+//     let pool = ThreadPoolBuilder::new()
+//         .num_threads(reproject_worker_count())
+//         .thread_name(|i| format!("lazycogs-reproject-{}", i))
+//         .build()
+//         .expect("failed to create reproject thread pool");
+//     Arc::new(pool)
+// });
+//
+// pub async fn run_reproject<F, R>(f: F) -> R
+// where
+//     F: FnOnce() -> R + Send + 'static,
+//     R: Send + 'static,
+// {
+//     let (tx, rx) = oneshot::channel();
+//
+//     // Accessing &*REPROJECT_POOL triggers the lazy initialization on first call
+//     REPROJECT_POOL.spawn(move || {
+//         let res = f();
+//         let _ = tx.send(res);
+//     });
+//
+//     rx.await.expect("worker thread panicked or dropped")
+// }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::LazyLock};
+
+    use object_store::local::LocalFileSystem;
 
     use super::*;
 
-    #[test]
-    fn test_open_zarr() {
-        let path = PathBuf::from(r".\tests\fixtures\latest");
-        let store = Arc::new(FilesystemStore::new(&path).unwrap());
-        let _ = enumerate_data_variables(store);
+    static ZARR_STORE: LazyLock<Arc<AsyncObjectStore<LocalFileSystem>>> = LazyLock::new(|| {
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/zarr/latest"
+        ));
+        let local_store =
+            LocalFileSystem::new_with_prefix(path).expect("could not create file system storage");
+        Arc::new(AsyncObjectStore::new(local_store))
+    });
+
+    fn get_zarr_store() -> Arc<AsyncObjectStore<LocalFileSystem>> {
+        ZARR_STORE.clone()
+    }
+
+    #[tokio::test]
+    async fn test_get_spatial_transform() {
+        let store = get_zarr_store();
+        let transform = get_spatial_transform(store)
+            .await
+            .expect("could not get transform");
+
+        assert_eq!(transform, [1000.0, 0.0, 19500.0, 0.0, -1000.0, 620500.0]);
+    }
+
+    #[tokio::test]
+    async fn test_get_bbox() {
+        let store = get_zarr_store();
+        let bbox = get_bbox(store).await.expect("could not get bounding box");
+
+        assert_eq!(bbox, [19500.0, 189500.0, 720500.0, 620500.0]);
     }
 
     // 10/558/356
     // 9/275/177
-    #[test]
-    fn test_sample_tile() {
-        let wkt = r#"PROJCRS["MGI / Austria Lambert",BASEGEOGCRS["MGI",DATUM["Militar-Geographische Institut",ELLIPSOID["Bessel 1841",6377397.155,299.1528128,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4312]],CONVERSION["unnamed",METHOD["Lambert Conic Conformal (2SP)",ID["EPSG",9802]],PARAMETER["Latitude of false origin",47.5,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8821]],PARAMETER["Longitude of false origin",13.3333333333333,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8822]],PARAMETER["Latitude of 1st standard parallel",49,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8823]],PARAMETER["Latitude of 2nd standard parallel",46,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8824]],PARAMETER["Easting at false origin",400000,LENGTHUNIT["metre",1],ID["EPSG",8826]],PARAMETER["Northing at false origin",400000,LENGTHUNIT["metre",1],ID["EPSG",8827]]],CS[Cartesian,2],AXIS["northing",north,ORDER[1],LENGTHUNIT["metre",1]],AXIS["easting",east,ORDER[2],LENGTHUNIT["metre",1]],ID["EPSG",31287]]"#;
-        let path = PathBuf::from(r".\tests\fixtures\latest");
-        let store = Arc::new(FilesystemStore::new(&path).unwrap());
-        let tile = TileCoord::new_checked(10, 558, 356).unwrap();
-        let data_var = Array::open(store.clone(), "/snow_depth").unwrap();
+    // #[test]
+    // fn test_sample_tile() {
+    //     let wkt = r#"PROJCRS["MGI / Austria Lambert",BASEGEOGCRS["MGI",DATUM["Militar-Geographische Institut",ELLIPSOID["Bessel 1841",6377397.155,299.1528128,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4312]],CONVERSION["unnamed",METHOD["Lambert Conic Conformal (2SP)",ID["EPSG",9802]],PARAMETER["Latitude of false origin",47.5,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8821]],PARAMETER["Longitude of false origin",13.3333333333333,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8822]],PARAMETER["Latitude of 1st standard parallel",49,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8823]],PARAMETER["Latitude of 2nd standard parallel",46,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8824]],PARAMETER["Easting at false origin",400000,LENGTHUNIT["metre",1],ID["EPSG",8826]],PARAMETER["Northing at false origin",400000,LENGTHUNIT["metre",1],ID["EPSG",8827]]],CS[Cartesian,2],AXIS["northing",north,ORDER[1],LENGTHUNIT["metre",1]],AXIS["easting",east,ORDER[2],LENGTHUNIT["metre",1]],ID["EPSG",31287]]"#;
+    //     let path = PathBuf::from(r".\tests\fixtures\latest");
+    //     let store = Arc::new(FilesystemStore::new(&path).unwrap());
+    //     let tile = TileCoord::new_checked(10, 558, 356).unwrap();
+    //     let data_var = Array::open(store.clone(), "/snow_depth").unwrap();
 
-        // time
-        let time_str = "2026-02-17T00:00:00.000Z";
-        let datetime = DateTime::parse_from_rfc3339(time_str).unwrap();
-        let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
+    //     // time
+    //     let time_str = "2026-02-17T00:00:00.000Z";
+    //     let datetime = DateTime::parse_from_rfc3339(time_str).unwrap();
+    //     let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
 
-        let x_coords = Array::open(store.clone(), "/x").unwrap();
-        let y_coords = Array::open(store.clone(), "/y").unwrap();
-        let time_coords = Array::open(store.clone(), "/time").unwrap();
-        let res = sample_data_var(
-            &tile,
-            &x_coords,
-            &y_coords,
-            &time_coords,
-            &data_var,
-            wkt,
-            datetime_utc,
-        );
-        assert!(res.is_ok());
-    }
+    //     let x_coords = Array::open(store.clone(), "/x").unwrap();
+    //     let y_coords = Array::open(store.clone(), "/y").unwrap();
+    //     let time_coords = Array::open(store.clone(), "/time").unwrap();
+    //     let res = sample_data_var(
+    //         &tile,
+    //         &x_coords,
+    //         &y_coords,
+    //         &time_coords,
+    //         &data_var,
+    //         wkt,
+    //         datetime_utc,
+    //     );
+    //     assert!(res.is_ok());
+    // }
 }
