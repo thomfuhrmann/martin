@@ -20,7 +20,7 @@ use zarrs_object_store::AsyncObjectStore;
 use crate::CacheZoomRange;
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::utils::{
-    calculate_warp_grid, data_variables, get_bbox, get_proj_code, get_spatial_shape,
+    TILE_PIXELS, calculate_warp_grid, data_variables, get_bbox, get_proj_code, get_spatial_shape,
     get_spatial_transform, sample_data_var, time_coords,
 };
 use crate::tiles::{MartinCoreResult, Source, UrlQuery};
@@ -275,6 +275,7 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                     self.time_coords.clone(),
                     datetime_utc,
                     data_var,
+                    TILE_PIXELS,
                 )
                 .await?;
                 return Ok(data);

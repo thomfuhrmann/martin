@@ -19,7 +19,7 @@ use zarrs::{
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::source::TARGET_CRS;
 
-const TILE_PIXELS: u32 = 512;
+pub(crate) const TILE_PIXELS: u32 = 512;
 const GRID_SIZE: usize = (2 * TILE_PIXELS * TILE_PIXELS) as usize;
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
 
@@ -206,6 +206,7 @@ pub async fn sample_data_var<T: ObjectStore>(
     time_coords: Option<Arc<Array<AsyncObjectStore<T>>>>,
     datetime: DateTime<Utc>,
     data_var: &Array<AsyncObjectStore<T>>,
+    tile_len: u32,
 ) -> Result<Vec<u8>, ZarrError> {
     // get time index
     let mut time_range = None;
@@ -219,8 +220,16 @@ pub async fn sample_data_var<T: ObjectStore>(
         .dimension_names()
         .as_deref()
         .ok_or(ZarrError::DimensionError("Missing dimension names".into()))?;
-    let x_range = warp_grid_bbox[0]..warp_grid_bbox[2];
-    let y_range = warp_grid_bbox[3]..warp_grid_bbox[1];
+
+    let x_end = warp_grid_bbox[2]
+        .checked_add(1)
+        .ok_or_else(|| ZarrError::DimensionError("x range overflow".into()))?;
+    let y_end = warp_grid_bbox[1]
+        .checked_add(1)
+        .ok_or_else(|| ZarrError::DimensionError("y range overflow".into()))?;
+    let x_range = warp_grid_bbox[0]..x_end;
+    let y_range = warp_grid_bbox[3]..y_end;
+
     let ranges = build_ranges(dimension_names, time_range.as_ref(), y_range, x_range)?;
     let perm = order_dimensions(dimension_names);
 
@@ -251,15 +260,32 @@ pub async fn sample_data_var<T: ObjectStore>(
         }
     };
 
-    // sample from array at tile grid points
-    // TODO: use no-data value
+    // sample from array at warp grid points
+    let (sampled_data, _min, _max) =
+        sample_warp_grid(&warp_grid, warp_grid_bbox, &tile_data, tile_len)?;
+
+    // cast to raw bytes
+    let raw_bytes = bytemuck::cast_slice::<f32, u8>(&sampled_data);
+
+    // compress with Zstd
+    let compressed_bytes = encode_all(raw_bytes, 3).map_err(ZarrError::EncodeError)?;
+    Ok(compressed_bytes)
+}
+
+// TODO: use no-data value
+fn sample_warp_grid(
+    warp_grid: &[i64],
+    warp_grid_bbox: [u64; 4],
+    tile_data: &ndarray::Array3<f32>,
+    tile_len: u32,
+) -> Result<(Box<[f32]>, f32, f32), ZarrError> {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
-    let mut sampled_data =
-        vec![f32::NAN; TILE_PIXELS as usize * TILE_PIXELS as usize].into_boxed_slice();
-    for i in 0..TILE_PIXELS {
-        for j in 0..TILE_PIXELS {
-            let idx = 2 * (i as usize * TILE_PIXELS as usize + j as usize);
+    let mut sampled_data = vec![f32::NAN; tile_len as usize * tile_len as usize].into_boxed_slice();
+
+    for i in 0..tile_len {
+        for j in 0..tile_len {
+            let idx = 2 * (i as usize * tile_len as usize + j as usize);
             let right = warp_grid[idx];
             let down = warp_grid[idx + 1];
 
@@ -289,71 +315,72 @@ pub async fn sample_data_var<T: ObjectStore>(
                 if value > max {
                     max = value;
                 }
-                sampled_data[(j as usize) * TILE_PIXELS as usize + i as usize] = value;
+                sampled_data[(j as usize) * tile_len as usize + i as usize] = value;
             }
         }
     }
 
-    // Cast to raw bytes
-    let raw_bytes = bytemuck::cast_slice::<f32, u8>(&sampled_data);
-
-    // Compress with Zstd
-    let compressed_bytes = encode_all(raw_bytes, 3).map_err(ZarrError::EncodeError)?;
-    Ok(compressed_bytes)
+    Ok((sampled_data, min, max))
 }
+
+type WarpGrid = (Box<[i64]>, [u64; 4]);
 
 pub(crate) fn calculate_warp_grid(
     tile: TileCoord,
     src_transform: [f64; 6],
     src_crs: &str,
     src_shape: [u64; 2],
-) -> Result<Option<(Box<[i64]>, [u64; 4])>, ZarrError> {
+) -> Result<Option<WarpGrid>, ZarrError> {
+    calculate_warp_grid_for_bbox(
+        tile_bbox(tile.x, tile.y, tile.z),
+        TARGET_CRS,
+        src_transform,
+        src_crs,
+        src_shape,
+        TILE_PIXELS,
+    )
+}
+
+fn calculate_warp_grid_for_bbox(
+    tile_bbox: [f64; 4],
+    target_crs: &str,
+    src_transform: [f64; 6],
+    src_crs: &str,
+    src_shape: [u64; 2],
+    tile_len: u32,
+) -> Result<Option<WarpGrid>, ZarrError> {
     // inverse affine transformation from spatial coordinate system to pixel grid
-    let src_a = src_transform[0];
-    let src_b = src_transform[1];
-    let src_c = src_transform[2];
-    let src_d = src_transform[3];
-    let src_e = src_transform[4];
-    let src_f = src_transform[5];
-    let det = src_a * src_e - src_b * src_d;
-    let src_inv_trafo = [
-        src_e / det,
-        -src_b / det,
-        (src_b * src_f - src_e * src_c) / det,
-        -src_d / det,
-        src_a / det,
-        (src_d * src_c - src_a * src_f) / det,
-    ];
+    let src_inv_affine = inverse_affine(src_transform);
 
     // inverse spatial coordinate transformation
     let inv_trafo =
-        proj::Proj::try_from((TARGET_CRS, src_crs)).map_err(ZarrError::ProjCreateError)?;
+        proj::Proj::try_from((target_crs, src_crs)).map_err(ZarrError::ProjCreateError)?;
 
-    // tile bounding box in Web Mercator
-    let tile = tile_bbox(tile.x, tile.y, tile.z);
-    let x_min_target = tile[0];
-    let y_min_target = tile[1];
-    let x_max_target = tile[2];
-    let y_max_target = tile[3];
+    // tile bounding box in spatial coordinates
+    let x_min_target = tile_bbox[0];
+    let y_min_target = tile_bbox[1];
+    let x_max_target = tile_bbox[2];
+    let y_max_target = tile_bbox[3];
 
     // calculate grid scales for target CRS based on tile size
-    let x_scale_target = (x_max_target - x_min_target) / f64::from(TILE_PIXELS);
-    let y_scale_target = (y_max_target - y_min_target) / f64::from(TILE_PIXELS);
+    let x_scale_target = (x_max_target - x_min_target) / f64::from(tile_len);
+    let y_scale_target = (y_max_target - y_min_target) / f64::from(tile_len);
 
-    let mut src_indices = vec![-1_i64; GRID_SIZE].into_boxed_slice();
+    let mut src_indices = vec![-1_i64; (2 * tile_len * tile_len) as usize].into_boxed_slice();
 
-    let mut tile_grid_left = -1_i64;
-    let mut tile_grid_right = -1_i64;
-    let mut tile_grid_bottom = -1_i64;
-    let mut tile_grid_top = -1_i64;
+    let mut tile_grid_left = i64::MAX;
+    let mut tile_grid_right = i64::MIN;
+    let mut tile_grid_bottom = i64::MIN;
+    let mut tile_grid_top = i64::MAX;
 
     #[allow(clippy::cast_precision_loss)]
     let width = src_shape[1] as f64;
     #[allow(clippy::cast_precision_loss)]
     let height = src_shape[0] as f64;
 
-    for i in 0..TILE_PIXELS {
-        for j in 0..TILE_PIXELS {
+    let mut has_valid_pixel = false;
+    for i in 0..tile_len {
+        for j in 0..tile_len {
             let x_target = x_min_target + (f64::from(i) + 0.5) * x_scale_target;
             let y_target = y_min_target + (f64::from(j) + 0.5) * y_scale_target;
 
@@ -362,9 +389,9 @@ pub(crate) fn calculate_warp_grid(
                 .map_err(ZarrError::ProjError)?;
 
             let right =
-                (src_inv_trafo[0] * x_src + src_inv_trafo[1] * y_src + src_inv_trafo[2]).round();
+                (src_inv_affine[0] * x_src + src_inv_affine[1] * y_src + src_inv_affine[2]).round();
             let down =
-                (src_inv_trafo[3] * x_src + src_inv_trafo[4] * y_src + src_inv_trafo[5]).round();
+                (src_inv_affine[3] * x_src + src_inv_affine[4] * y_src + src_inv_affine[5]).round();
 
             #[allow(clippy::cast_possible_truncation)]
             let right = if (0.0..width).contains(&right) {
@@ -380,25 +407,15 @@ pub(crate) fn calculate_warp_grid(
                 -1
             };
 
-            if right >= 0 {
-                tile_grid_left = if tile_grid_left == -1 {
-                    right
-                } else {
-                    tile_grid_left.min(right)
-                };
+            if right >= 0 && down >= 0 {
+                has_valid_pixel = true;
+                tile_grid_left = tile_grid_left.min(right);
                 tile_grid_right = tile_grid_right.max(right);
-            }
-
-            if down >= 0 {
-                tile_grid_top = if tile_grid_top == -1 {
-                    down
-                } else {
-                    tile_grid_top.min(down)
-                };
+                tile_grid_top = tile_grid_top.min(down);
                 tile_grid_bottom = tile_grid_bottom.max(down);
             }
 
-            let idx = 2 * (i as usize * TILE_PIXELS as usize + j as usize);
+            let idx = 2 * (i as usize * tile_len as usize + j as usize);
 
             src_indices[idx] = right;
             src_indices[idx + 1] = down;
@@ -406,11 +423,7 @@ pub(crate) fn calculate_warp_grid(
     }
 
     // tile grid lies outside source data
-    if tile_grid_left == -1
-        || tile_grid_bottom == -1
-        || tile_grid_right == -1
-        || tile_grid_top == -1
-    {
+    if !has_valid_pixel {
         return Ok(None);
     }
 
@@ -423,6 +436,24 @@ pub(crate) fn calculate_warp_grid(
             tile_grid_top.cast_unsigned(),
         ],
     )))
+}
+
+fn inverse_affine(transform: [f64; 6]) -> [f64; 6] {
+    let src_a = transform[0];
+    let src_b = transform[1];
+    let src_c = transform[2];
+    let src_d = transform[3];
+    let src_e = transform[4];
+    let src_f = transform[5];
+    let det = src_a * src_e - src_b * src_d;
+    [
+        src_e / det,
+        -src_b / det,
+        (src_b * src_f - src_e * src_c) / det,
+        -src_d / det,
+        src_a / det,
+        (src_d * src_c - src_a * src_f) / det,
+    ]
 }
 
 fn build_ranges(
@@ -627,33 +658,162 @@ mod tests {
         assert_eq!(bbox, [19500.0, 189500.0, 720500.0, 620500.0]);
     }
 
+    #[test]
+    fn test_inverse_affine() {
+        let transform = [2.0, 0.0, 10.0, 0.0, 3.0, 20.0];
+        let inverse = inverse_affine(transform);
+
+        let x = inverse[0] * 12.0 + inverse[1] * 23.0 + inverse[2];
+        let y = inverse[3] * 12.0 + inverse[4] * 23.0 + inverse[5];
+
+        assert!((x - 1.0).abs() < 1e-12);
+        assert!((y - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_warp_grid_size() {
+        let (warp_grid, warp_grid_bbox) = calculate_warp_grid_for_bbox(
+            [0.0, 0.0, 4.0, 4.0],
+            "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "EPSG:4326",
+            [4, 4],
+            4,
+        )
+        .expect("could not calculate warp grid")
+        .expect("should be some");
+
+        assert_eq!(warp_grid.len(), 32);
+    }
+
+    #[test]
+    fn test_warp_grid_identity() {
+        let result = calculate_warp_grid_for_bbox(
+            [0.0, 0.0, 4.0, 4.0],
+            "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "EPSG:4326",
+            [4, 4],
+            4,
+        )
+        .expect("could not calculate warp grid");
+
+        assert_eq!(
+            result,
+            Some((
+                vec![
+                    1, 1, 1, 2, 1, 3, 1, -1, 2, 1, 2, 2, 2, 3, 2, -1, 3, 1, 3, 2, 3, 3, 3, -1, -1,
+                    1, -1, 2, -1, 3, -1, -1
+                ]
+                .into_boxed_slice(),
+                [1, 3, 3, 1]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_warp_grid_outside() {
+        let result = calculate_warp_grid_for_bbox(
+            [5.0, 10.0, 7.0, 12.0],
+            "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "EPSG:4326",
+            [4, 4],
+            4,
+        )
+        .expect("could not calculate warp grid");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sample_warp_grid() {
+        let mut data = ndarray::Array3::<f32>::zeros((1, 4, 4));
+
+        for y in 0..3 {
+            for x in 0..3 {
+                data[[0, y, x]] = (y * 10 + x) as f32;
+            }
+        }
+
+        let (warp_grid, warp_grid_bbox) = calculate_warp_grid_for_bbox(
+            [0.0, 0.0, 4.0, 4.0],
+            "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "EPSG:4326",
+            [4, 4],
+            4,
+        )
+        .expect("could not calculate warp grid")
+        .expect("should be some");
+
+        let (sampled_data, min, max) = sample_warp_grid(&warp_grid, warp_grid_bbox, &data, 4)
+            .expect("could not calculate warp grid");
+
+        assert_eq!(sampled_data[6], 12.0);
+        assert_eq!(min, 0.0);
+        assert_eq!(max, 22.0);
+    }
+
+    #[test]
+    fn test_warp_grid_partial() {
+        let result = calculate_warp_grid_for_bbox(
+            [2.0, 2.0, 5.0, 5.0],
+            "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "EPSG:4326",
+            [4, 4],
+            4,
+        )
+        .expect("could not calculate warp grid");
+
+        assert_eq!(
+            result,
+            Some((
+                vec![
+                    2, 2, 2, 3, 2, -1, 2, -1, 3, 2, 3, 3, 3, -1, 3, -1, -1, 2, -1, 3, -1, -1, -1,
+                    -1, -1, 2, -1, 3, -1, -1, -1, -1
+                ]
+                .into_boxed_slice(),
+                [2, 3, 3, 2]
+            ))
+        );
+    }
+
     // 10/558/356
     // 9/275/177
-    // #[test]
-    // fn test_sample_tile() {
-    //     let wkt = r#"PROJCRS["MGI / Austria Lambert",BASEGEOGCRS["MGI",DATUM["Militar-Geographische Institut",ELLIPSOID["Bessel 1841",6377397.155,299.1528128,LENGTHUNIT["metre",1]]],PRIMEM["Greenwich",0,ANGLEUNIT["degree",0.0174532925199433]],ID["EPSG",4312]],CONVERSION["unnamed",METHOD["Lambert Conic Conformal (2SP)",ID["EPSG",9802]],PARAMETER["Latitude of false origin",47.5,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8821]],PARAMETER["Longitude of false origin",13.3333333333333,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8822]],PARAMETER["Latitude of 1st standard parallel",49,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8823]],PARAMETER["Latitude of 2nd standard parallel",46,ANGLEUNIT["degree",0.0174532925199433],ID["EPSG",8824]],PARAMETER["Easting at false origin",400000,LENGTHUNIT["metre",1],ID["EPSG",8826]],PARAMETER["Northing at false origin",400000,LENGTHUNIT["metre",1],ID["EPSG",8827]]],CS[Cartesian,2],AXIS["northing",north,ORDER[1],LENGTHUNIT["metre",1]],AXIS["easting",east,ORDER[2],LENGTHUNIT["metre",1]],ID["EPSG",31287]]"#;
-    //     let path = PathBuf::from(r".\tests\fixtures\latest");
-    //     let store = Arc::new(FilesystemStore::new(&path).unwrap());
-    //     let tile = TileCoord::new_checked(10, 558, 356).unwrap();
-    //     let data_var = Array::open(store.clone(), "/snow_depth").unwrap();
+    #[tokio::test]
+    async fn test_sample_tile() {
+        let store = get_zarr_store();
+        let data_var = Array::async_open(Arc::clone(&store), "/snow_depth")
+            .await
+            .unwrap();
 
-    //     // time
-    //     let time_str = "2026-02-17T00:00:00.000Z";
-    //     let datetime = DateTime::parse_from_rfc3339(time_str).unwrap();
-    //     let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
+        let tile = TileCoord::new_checked(10, 558, 356).unwrap();
 
-    //     let x_coords = Array::open(store.clone(), "/x").unwrap();
-    //     let y_coords = Array::open(store.clone(), "/y").unwrap();
-    //     let time_coords = Array::open(store.clone(), "/time").unwrap();
-    //     let res = sample_data_var(
-    //         &tile,
-    //         &x_coords,
-    //         &y_coords,
-    //         &time_coords,
-    //         &data_var,
-    //         wkt,
-    //         datetime_utc,
-    //     );
-    //     assert!(res.is_ok());
-    // }
+        // time
+        let time_str = "2026-08-13T00:00:00.000Z";
+        let datetime = DateTime::parse_from_rfc3339(time_str).unwrap();
+        let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
+
+        let time_coords = time_coords(Arc::clone(&store)).await.unwrap().map(Arc::new);
+        let src_transform = get_spatial_transform(Arc::clone(&store)).await.unwrap();
+        let src_bbox = get_bbox(Arc::clone(&store)).await.unwrap();
+        let src_shape = get_spatial_shape(Arc::clone(&store)).await.unwrap();
+        let src_crs = get_proj_code(Arc::clone(&store)).await.unwrap();
+        let (warp_grid, warp_grid_bbox) =
+            calculate_warp_grid(tile, src_transform, src_crs.as_str(), src_shape)
+                .expect("could not calculate warp grid")
+                .expect("should be some");
+        let res = sample_data_var(
+            warp_grid,
+            warp_grid_bbox,
+            time_coords,
+            datetime_utc,
+            &data_var,
+            TILE_PIXELS,
+        )
+        .await;
+        assert!(res.is_ok());
+    }
 }
