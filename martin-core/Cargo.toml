@@ -103,6 +103,7 @@ zarr = [
     "dep:ndarray",
     "dep:bytemuck",
     "dep:zstd",
+    "dep:rayon",
     "_tiles",
 ]
 

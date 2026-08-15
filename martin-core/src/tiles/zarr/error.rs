@@ -27,16 +27,28 @@ pub enum ZarrError {
     /// Zarr node create error
     #[error("Zarr node create error: {0}")]
     NodeCreateError(#[source] zarrs::node::NodeCreateError),
-    /// Zarr WKT error
-    #[error("WKT error: {0}")]
-    WktError(String),
     /// Zarr attribute error
     #[error("Zarr attribute error: {0}")]
     AttributeError(String),
     /// Chrono parse error
     #[error("Chrono parsing error: {0}")]
     ParseError(chrono::ParseError),
+    /// Projection creation error
+    #[error("Projection create error: {0}")]
+    ProjCreateError(proj::ProjCreateError),
     /// Projection error
-    #[error("Projection error: {0}")]
+    #[error("Conversion error: {0}")]
     ProjError(proj::ProjError),
+    /// Time error
+    #[error("Time attribute error: {0}")]
+    TimeError(String),
+    /// Dimension error
+    #[error("Dimension error: {0}")]
+    DimensionError(String),
+    /// Encode error
+    #[error("Encode error: {0}")]
+    EncodeError(std::io::Error),
+    /// Cast error
+    #[error("Cast error: {0}")]
+    CastError(String),
 }

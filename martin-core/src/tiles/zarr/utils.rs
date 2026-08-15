@@ -1,8 +1,9 @@
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone as _, Utc};
 use core::f64;
 use object_store::ObjectStore;
 use zarrs::node::async_get_child_nodes;
 use zarrs_object_store::AsyncObjectStore;
+use zstd::encode_all;
 // use image::{ImageBuffer, LumaA};
 use martin_tile_utils::TileCoord;
 use std::{error::Error, ops::Range, sync::Arc};
@@ -16,6 +17,20 @@ use zarrs::{
 };
 
 use crate::tiles::zarr::error::ZarrError;
+use crate::tiles::zarr::source::TARGET_CRS;
+
+const TILE_PIXELS: u32 = 512;
+const GRID_SIZE: usize = (2 * TILE_PIXELS * TILE_PIXELS) as usize;
+const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
+
+/// Calculates the spatial bounding box of a tile
+pub fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
+    let tile_length = EARTH_CIRCUMFERENCE / f64::from(1_u32 << zoom);
+    let min_x = EARTH_CIRCUMFERENCE * -0.5 + f64::from(x) * tile_length;
+    let max_y = EARTH_CIRCUMFERENCE * 0.5 - f64::from(y) * tile_length;
+
+    [min_x, max_y - tile_length, min_x + tile_length, max_y]
+}
 
 /// Retrieve all data variables of this store - arrays that are not dimensions
 pub async fn data_variables<T: ObjectStore>(
@@ -135,8 +150,25 @@ pub async fn get_bbox<T: ObjectStore>(
         .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:transform format: {e}")))
 }
 
+/// Get the shape of the source array
+pub async fn get_spatial_shape<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<[u64; 2], ZarrError> {
+    let root_group = Group::async_open(store, NodePath::root().as_str())
+        .await
+        .map_err(ZarrError::GroupCreateError)?;
+
+    let transform_value = root_group
+        .attributes()
+        .get("spatial:shape")
+        .ok_or_else(|| ZarrError::AttributeError("spatial:shape is missing".into()))?;
+
+    serde_json::from_value::<[u64; 2]>(transform_value.clone())
+        .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:shape format: {e}")))
+}
+
 /// Returns the names of the spatial dimensions
-pub fn get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
+pub fn _get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
     array
         .attributes()
         .get("spatial:dimensions")
@@ -144,7 +176,8 @@ pub fn get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
         .and_then(|dims| dims.iter().map(|dim| dim.as_str()).collect())
 }
 
-pub fn get_non_spatial_dims(
+/// Returns the names of non-spatial dimensions
+pub fn _get_non_spatial_dims(
     array: &Array<FilesystemStore>,
     spatial_dims: &Vec<&str>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
@@ -166,343 +199,262 @@ pub fn get_non_spatial_dims(
     Ok(non_spatial)
 }
 
-const TILE_PIXELS: u32 = 512;
-const TARGET_CRS: &str = "EPSG:3857";
-
-/// Sample from array using a projection
+/// Sample from array using a warp-grid
 pub async fn sample_data_var<T: ObjectStore>(
-    tile: &TileCoord,
-    src_crs: &str,
-    src_transform: [f64; 6],
-    src_bbox: [f64; 4],
+    warp_grid: Box<[i64]>,
+    warp_grid_bbox: [u64; 4],
     time_coords: Option<Arc<Array<AsyncObjectStore<T>>>>,
     datetime: DateTime<Utc>,
     data_var: &Array<AsyncObjectStore<T>>,
-) -> Result<Vec<u8>, Box<dyn Error>> {
-    return Ok(vec![]);
+) -> Result<Vec<u8>, ZarrError> {
+    // get time index
+    let mut time_range = None;
+    if let Some(arr) = time_coords {
+        let temporal_index = TimeMetadata::get_temporal_index(&arr, datetime).await?;
+        time_range = Some(temporal_index..temporal_index + 1);
+    }
 
-    // Load data for x-coordinates
-    //    let data_type = x_coords.data_type();
-    //    let name = data_type.name(ZarrVersion::V3);
-    //    let data_x = match name.as_deref() {
-    //        Some("int32") => x_coords
-    //            .retrieve_array_subset::<ndarray::Array1<i32>>(&[0..2])?
-    //            .mapv(|v| v as f64),
-    //        Some("int64") => x_coords
-    //            .retrieve_array_subset::<ndarray::Array1<i64>>(&[0..2])?
-    //            .mapv(|v| v as f64),
-    //        Some("float32") => x_coords
-    //            .retrieve_array_subset::<ndarray::Array1<f32>>(&[0..2])?
-    //            .mapv(|v| v as f64),
-    //        Some("float64") => x_coords.retrieve_array_subset::<ndarray::Array1<f64>>(&[0..2])?,
-    //        _ => panic!("Data type not implemented yet"),
-    //    };
+    // permute tile data to have a fixed order: time, y, x
+    let dimension_names = data_var
+        .dimension_names()
+        .as_deref()
+        .ok_or(ZarrError::DimensionError("Missing dimension names".into()))?;
+    let x_range = warp_grid_bbox[0]..warp_grid_bbox[2];
+    let y_range = warp_grid_bbox[3]..warp_grid_bbox[1];
+    let ranges = build_ranges(dimension_names, time_range.as_ref(), y_range, x_range)?;
+    let perm = order_dimensions(dimension_names);
 
-    //    // Load data for y-coordinates
-    //    let data_type = y_coords.data_type();
-    //    let name = data_type.name(ZarrVersion::V3);
-    //    let data_y = match name.as_deref() {
-    //        Some("int32") => y_coords
-    //            .retrieve_array_subset::<ndarray::Array1<i32>>(&[0..2])?
-    //            .mapv(|v| v as f64),
-    //        Some("int64") => y_coords
-    //            .retrieve_array_subset::<ndarray::Array1<i64>>(&[0..2])?
-    //            .mapv(|v| v as f64),
-    //        Some("float32") => y_coords
-    //            .retrieve_array_subset::<ndarray::Array1<f32>>(&[0..2])?
-    //            .mapv(|v| v as f64),
-    //        Some("float64") => y_coords.retrieve_array_subset::<ndarray::Array1<f64>>(&[0..2])?,
-    //        _ => panic!("Data type not implemented yet"),
-    //    };
+    let tile_data = match ranges.len() {
+        3 => {
+            let data = data_var
+                .async_retrieve_array_subset::<ndarray::Array3<f32>>(&ranges.as_slice())
+                .await
+                .map_err(ZarrError::ArrayError)?;
 
-    //    // Calculate spatial origin and spacing of array data
-    //    let x_0 = data_x[0];
-    //    let spacing_x = data_x[1] - data_x[0];
+            data.permuted_axes([perm[0], perm[1], perm[2]])
+        }
 
-    //    let y_0 = data_y[0];
-    //    let spacing_y = data_y[1] - data_y[0];
+        2 => {
+            let data = data_var
+                .async_retrieve_array_subset::<ndarray::Array2<f32>>(&ranges.as_slice())
+                .await
+                .map_err(ZarrError::ArrayError)?;
 
-    //    // Initialize coordinate transformation
-    //    let transformer = proj::Proj::try_from((SOURCE_CRS, wkt_str))?;
+            data.permuted_axes([perm[0], perm[1]])
+                .insert_axis(ndarray::Axis(0))
+        }
 
-    //    // Get tile bounding box in Web Mercator
-    //    let tile = tile_bbox(tile.x, tile.y, tile.z);
-    //    let x_min_source = tile[0];
-    //    let y_min_source = tile[1];
-    //    let x_max_source = tile[2];
-    //    let y_max_source = tile[3];
+        _ => {
+            return Err(ZarrError::DimensionError(
+                "Expected 2 or 3 dimensions".into(),
+            ));
+        }
+    };
 
-    //    // Calculate grid spacings for source CRS based on tile size
-    //    let spacing_x_source = (x_max_source - x_min_source) / f64::from(TILE_PIXELS);
-    //    let spacing_y_source = (y_max_source - y_min_source) / f64::from(TILE_PIXELS);
+    // sample from array at tile grid points
+    // TODO: use no-data value
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sampled_data =
+        vec![f32::NAN; TILE_PIXELS as usize * TILE_PIXELS as usize].into_boxed_slice();
+    for i in 0..TILE_PIXELS {
+        for j in 0..TILE_PIXELS {
+            let idx = 2 * (i as usize * TILE_PIXELS as usize + j as usize);
+            let right = warp_grid[idx];
+            let down = warp_grid[idx + 1];
 
-    //    // Transform tile bounding box corners from Web Mercator to target system
-    //    let (bl_x_target, bl_y_target) = transformer.convert((x_min_source, y_min_source))?;
-    //    let (br_x_target, br_y_target) = transformer.convert((x_max_source, y_min_source))?;
-    //    let (tl_x_target, tl_y_target) = transformer.convert((x_min_source, y_max_source))?;
-    //    let (tr_x_target, tr_y_target) = transformer.convert((x_max_source, y_max_source))?;
+            // map to relative indices
+            let rel_right = if right == -1 {
+                right
+            } else {
+                right - warp_grid_bbox[0].cast_signed()
+            };
 
-    //    // Calculate array indices of bounding box
-    //    let bl_ix = ((bl_x_target - x_0) / spacing_x).round() as u64;
-    //    let br_ix = ((br_x_target - x_0) / spacing_x).round() as u64;
-    //    let tl_ix = ((tl_x_target - x_0) / spacing_x).round() as u64;
-    //    let tr_ix = ((tr_x_target - x_0) / spacing_x).round() as u64;
+            let rel_down = if down == -1 {
+                down
+            } else {
+                down - warp_grid_bbox[3].cast_signed()
+            };
 
-    //    let mut min_ix = bl_ix.min(br_ix).min(tl_ix).min(tr_ix);
-    //    let mut max_ix = bl_ix.max(br_ix).max(tl_ix).max(tr_ix);
+            // bounds check and sample
+            if rel_right != -1 && rel_down != -1 {
+                let rel_down = usize::try_from(rel_down)
+                    .map_err(|e| ZarrError::CastError(format!("Could not cast to usize: {e:?}")))?;
+                let rel_right = usize::try_from(rel_right)
+                    .map_err(|e| ZarrError::CastError(format!("Could not cast to usize: {e:?}")))?;
+                let value = tile_data[[0, rel_down, rel_right]];
+                if value < min {
+                    min = value;
+                }
+                if value > max {
+                    max = value;
+                }
+                sampled_data[(j as usize) * TILE_PIXELS as usize + i as usize] = value;
+            }
+        }
+    }
 
-    //    let bl_iy = ((bl_y_target - y_0) / spacing_y).round() as u64;
-    //    let br_iy = ((br_y_target - y_0) / spacing_y).round() as u64;
-    //    let tl_iy = ((tl_y_target - y_0) / spacing_y).round() as u64;
-    //    let tr_iy = ((tr_y_target - y_0) / spacing_y).round() as u64;
+    // Cast to raw bytes
+    let raw_bytes = bytemuck::cast_slice::<f32, u8>(&sampled_data);
 
-    //    let mut min_iy = bl_iy.min(br_iy).min(tl_iy).min(tr_iy);
-    //    let mut max_iy = bl_iy.max(br_iy).max(tl_iy).max(tr_iy);
-
-    //    // Swap indices if coordinate array is in descending order
-    //    if min_ix > max_ix {
-    //        let temp = min_ix;
-    //        min_ix = max_ix;
-    //        max_ix = temp;
-    //    }
-
-    //    if min_iy > max_iy {
-    //        let temp = min_iy;
-    //        min_iy = max_iy;
-    //        max_iy = temp;
-    //    }
-
-    //    // Add buffer
-    //    let buffer = 8;
-    //    min_ix = min_ix.saturating_sub(buffer);
-    //    min_iy = min_iy.saturating_sub(buffer);
-    //    max_ix = max_ix.saturating_add(buffer);
-    //    max_iy = max_iy.saturating_add(buffer);
-
-    //    // Set index ranges
-    //    let target_width = x_coords.shape()[0];
-    //    let x_range_start = min_ix.min(target_width);
-    //    let x_range_end = (max_ix + 1).min(target_width);
-    //    let x_range = x_range_start..x_range_end;
-
-    //    let target_height = y_coords.shape()[0];
-    //    let y_range_start = min_iy.min(target_height);
-    //    let y_range_end = (max_iy + 1).min(target_height);
-    //    let y_range = y_range_start..y_range_end;
-
-    //    // Load tile data into memory
-    //    let temporal_index = get_temporal_index(time_coords, datetime)? as u64;
-    //    let temporal_range = temporal_index..temporal_index + 1;
-
-    //    // Permute tile data to have a fixed order: time, x, y
-    //    let dimension_names = data_var.dimension_names();
-    //    let indices = build_subset(dimension_names, temporal_range, x_range, y_range);
-    //    let perm = order_dimensions(dimension_names);
-    //    let tile_data = data_var
-    //        .retrieve_array_subset::<ndarray::Array3<f32>>(&[
-    //            indices[0].clone(),
-    //            indices[1].clone(),
-    //            indices[2].clone(),
-    //        ])?
-    //        .permuted_axes(perm);
-
-    //    // Sample from array at tile grid points
-    //    let width = x_range_end - x_range_start;
-    //    let height = y_range_end - y_range_start;
-    //    let mut min = f32::INFINITY;
-    //    let mut max = f32::NEG_INFINITY;
-    //    let mut sampled_data = [f32::NAN; TILE_PIXELS as usize * TILE_PIXELS as usize];
-    //    for i in 0..TILE_PIXELS {
-    //        for j in 0..TILE_PIXELS {
-    //            let x = x_min_source + (f64::from(i) + 0.5) * spacing_x_source;
-    //            let y = y_min_source + (f64::from(j) + 0.5) * spacing_y_source;
-
-    //            // Transform from Web Mercator to target system
-    //            let (xt, yt) = transformer.convert((x, y))?;
-
-    //            // Index calculation
-    //            // use i64 for intermediate calculations to handle coordinates
-    //            // that might fall outside min_ix/min_iy
-    //            let abs_ix = ((xt - x_0) / spacing_x).round() as i64;
-    //            let abs_iy = ((yt - y_0) / spacing_y).round() as i64;
-
-    //            // Map to relative index
-    //            let rel_ix = abs_ix - min_ix as i64;
-    //            let rel_iy = abs_iy - min_iy as i64;
-
-    //            // Bounds check and sample
-    //            if rel_ix >= 0 && rel_ix < width as i64 && rel_iy >= 0 && rel_iy < height as i64 {
-    //                let value = tile_data[[0, rel_ix as usize, rel_iy as usize]];
-    //                if value < min {
-    //                    min = value;
-    //                }
-    //                if value > max {
-    //                    max = value;
-    //                }
-
-    //                sampled_data[(j as usize) * TILE_PIXELS as usize + i as usize] = value;
-    //            }
-    //        }
-    //    }
-
-    //    // Cast to raw bytes
-    //    let raw_bytes = bytemuck::cast_slice::<f32, u8>(&sampled_data);
-
-    //    // Compress with Zstd
-    //    let compressed_bytes = encode_all(raw_bytes, 3)?;
-    //    Ok(compressed_bytes)
+    // Compress with Zstd
+    let compressed_bytes = encode_all(raw_bytes, 3).map_err(ZarrError::EncodeError)?;
+    Ok(compressed_bytes)
 }
 
-fn calculate_warp_grid(
+pub(crate) fn calculate_warp_grid(
     tile: TileCoord,
     src_transform: [f64; 6],
-    src_bbox: [f64; 4],
     src_crs: &str,
-) -> Result<[u32; 1024], ZarrError> {
-    // Calculate spatial origin and spacing of array data
-    let spacing_x = src_transform[0];
-    let x_0 = src_transform[2];
+    src_shape: [u64; 2],
+) -> Result<Option<(Box<[i64]>, [u64; 4])>, ZarrError> {
+    // inverse affine transformation from spatial coordinate system to pixel grid
+    let src_a = src_transform[0];
+    let src_b = src_transform[1];
+    let src_c = src_transform[2];
+    let src_d = src_transform[3];
+    let src_e = src_transform[4];
+    let src_f = src_transform[5];
+    let det = src_a * src_e - src_b * src_d;
+    let src_inv_trafo = [
+        src_e / det,
+        -src_b / det,
+        (src_b * src_f - src_e * src_c) / det,
+        -src_d / det,
+        src_a / det,
+        (src_d * src_c - src_a * src_f) / det,
+    ];
 
-    let spacing_y = src_transform[4];
-    let y_0 = src_transform[5];
+    // inverse spatial coordinate transformation
+    let inv_trafo =
+        proj::Proj::try_from((TARGET_CRS, src_crs)).map_err(ZarrError::ProjCreateError)?;
 
-    // Initialize coordinate transformation
-    let transformer = proj::Proj::try_from((TARGET_CRS, src_crs))?;
-
-    // let x_min_source = src_bbox[0];
-    // let y_min_source = src_bbox[1];
-    // let x_max_source = src_bbox[2];
-    // let y_max_source = src_bbox[3];
-
-    // Get tile bounding box in Web Mercator
+    // tile bounding box in Web Mercator
     let tile = tile_bbox(tile.x, tile.y, tile.z);
-    let x_min = tile[0];
-    let y_min = tile[1];
-    let x_max = tile[2];
-    let y_max = tile[3];
+    let x_min_target = tile[0];
+    let y_min_target = tile[1];
+    let x_max_target = tile[2];
+    let y_max_target = tile[3];
 
-    // Calculate grid spacings for target CRS based on tile size
-    let spacing_x_source = (x_max - x_min) / f64::from(TILE_PIXELS);
-    let spacing_y_source = (y_max - y_min) / f64::from(TILE_PIXELS);
+    // calculate grid scales for target CRS based on tile size
+    let x_scale_target = (x_max_target - x_min_target) / f64::from(TILE_PIXELS);
+    let y_scale_target = (y_max_target - y_min_target) / f64::from(TILE_PIXELS);
 
-    // Transform tile bounding box corners from Web Mercator to source system
-    let (x_min_src, y_min_src) = transformer
-        .convert((x_min, y_min))
-        .map_err(ZarrError::ProjError)?;
-    let (x_max_src, y_max_src) = transformer
-        .convert((x_max, y_max))
-        .map_err(ZarrError::ProjError)?;
+    let mut src_indices = vec![-1_i64; GRID_SIZE].into_boxed_slice();
 
-    // Calculate array indices of bounding box
-    let bl_ix = ((x_min_src - x_0) / spacing_x).round() as u64;
-    let br_ix = ((br_x_target - x_0) / spacing_x).round() as u64;
-    let tl_ix = ((tl_x_target - x_0) / spacing_x).round() as u64;
-    let tr_ix = ((tr_x_target - x_0) / spacing_x).round() as u64;
+    let mut tile_grid_left = -1_i64;
+    let mut tile_grid_right = -1_i64;
+    let mut tile_grid_bottom = -1_i64;
+    let mut tile_grid_top = -1_i64;
 
-    let mut min_ix = bl_ix.min(br_ix).min(tl_ix).min(tr_ix);
-    let mut max_ix = bl_ix.max(br_ix).max(tl_ix).max(tr_ix);
+    #[allow(clippy::cast_precision_loss)]
+    let width = src_shape[1] as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let height = src_shape[0] as f64;
 
-    let bl_iy = ((bl_y_target - y_0) / spacing_y).round() as u64;
-    let br_iy = ((br_y_target - y_0) / spacing_y).round() as u64;
-    let tl_iy = ((tl_y_target - y_0) / spacing_y).round() as u64;
-    let tr_iy = ((tr_y_target - y_0) / spacing_y).round() as u64;
+    for i in 0..TILE_PIXELS {
+        for j in 0..TILE_PIXELS {
+            let x_target = x_min_target + (f64::from(i) + 0.5) * x_scale_target;
+            let y_target = y_min_target + (f64::from(j) + 0.5) * y_scale_target;
 
-    let mut min_iy = bl_iy.min(br_iy).min(tl_iy).min(tr_iy);
-    let mut max_iy = bl_iy.max(br_iy).max(tl_iy).max(tr_iy);
+            let (x_src, y_src) = inv_trafo
+                .convert((x_target, y_target))
+                .map_err(ZarrError::ProjError)?;
 
-    // Swap indices if coordinate array is in descending order
-    if min_ix > max_ix {
-        let temp = min_ix;
-        min_ix = max_ix;
-        max_ix = temp;
+            let right =
+                (src_inv_trafo[0] * x_src + src_inv_trafo[1] * y_src + src_inv_trafo[2]).round();
+            let down =
+                (src_inv_trafo[3] * x_src + src_inv_trafo[4] * y_src + src_inv_trafo[5]).round();
+
+            #[allow(clippy::cast_possible_truncation)]
+            let right = if (0.0..width).contains(&right) {
+                right as i64
+            } else {
+                -1
+            };
+
+            #[allow(clippy::cast_possible_truncation)]
+            let down = if (0.0..height).contains(&down) {
+                down as i64
+            } else {
+                -1
+            };
+
+            if right >= 0 {
+                tile_grid_left = if tile_grid_left == -1 {
+                    right
+                } else {
+                    tile_grid_left.min(right)
+                };
+                tile_grid_right = tile_grid_right.max(right);
+            }
+
+            if down >= 0 {
+                tile_grid_top = if tile_grid_top == -1 {
+                    down
+                } else {
+                    tile_grid_top.min(down)
+                };
+                tile_grid_bottom = tile_grid_bottom.max(down);
+            }
+
+            let idx = 2 * (i as usize * TILE_PIXELS as usize + j as usize);
+
+            src_indices[idx] = right;
+            src_indices[idx + 1] = down;
+        }
     }
 
-    if min_iy > max_iy {
-        let temp = min_iy;
-        min_iy = max_iy;
-        max_iy = temp;
+    // tile grid lies outside source data
+    if tile_grid_left == -1
+        || tile_grid_bottom == -1
+        || tile_grid_right == -1
+        || tile_grid_top == -1
+    {
+        return Ok(None);
     }
 
-    // Add buffer
-    let buffer = 8;
-    min_ix = min_ix.saturating_sub(buffer);
-    min_iy = min_iy.saturating_sub(buffer);
-    max_ix = max_ix.saturating_add(buffer);
-    max_iy = max_iy.saturating_add(buffer);
-
-    // Set index ranges
-    let target_width = x_coords.shape()[0];
-    let x_range_start = min_ix.min(target_width);
-    let x_range_end = (max_ix + 1).min(target_width);
-    let x_range = x_range_start..x_range_end;
-
-    let target_height = y_coords.shape()[0];
-    let y_range_start = min_iy.min(target_height);
-    let y_range_end = (max_iy + 1).min(target_height);
-    let y_range = y_range_start..y_range_end;
-
-    // Load tile data into memory
-    let temporal_index = get_temporal_index(time_coords, datetime)? as u64;
-    let temporal_range = temporal_index..temporal_index + 1;
-
-    // Permute tile data to have a fixed order: time, x, y
-    let dimension_names = data_var.dimension_names();
-    let indices = build_subset(dimension_names, temporal_range, x_range, y_range);
-    Ok([0; 1024])
+    Ok(Some((
+        src_indices,
+        [
+            tile_grid_left.cast_unsigned(),
+            tile_grid_bottom.cast_unsigned(),
+            tile_grid_right.cast_unsigned(),
+            tile_grid_top.cast_unsigned(),
+        ],
+    )))
 }
 
-fn build_subset(
-    dimension_names: &Option<Vec<DimensionName>>,
-    time: Range<u64>,
-    x: Range<u64>,
+fn build_ranges(
+    dimension_names: &[DimensionName],
+    time: Option<&Range<u64>>,
     y: Range<u64>,
-) -> Vec<Range<u64>> {
-    match dimension_names {
-        Some(names) => names
-            .iter()
-            .map(|name| match name.as_deref() {
-                Some("time") => time.clone(),
-                Some("y") => y.clone(),
-                Some("x") => x.clone(),
-                _ => panic!("Unknown dimension in metadata: {:?}", name),
-            })
-            .collect(),
-        None => {
-            vec![time, x, y]
-        }
-    }
+    x: Range<u64>,
+) -> Result<Vec<Range<u64>>, ZarrError> {
+    dimension_names
+        .iter()
+        .map(|name| match name.as_deref() {
+            Some("time") => time
+                .cloned()
+                .ok_or_else(|| ZarrError::TimeError("Missing time array indices".into())),
+            Some("y") => Ok(y.clone()),
+            Some("x") => Ok(x.clone()),
+            _ => Err(ZarrError::DimensionError(format!(
+                "Unknown dimension: {name:?}"
+            ))),
+        })
+        .collect()
 }
 
-fn order_dimensions(dimension_names: &Option<Vec<DimensionName>>) -> [usize; 3] {
-    match dimension_names {
-        Some(names) => {
-            let t_axis = names
+fn order_dimensions(names: &[DimensionName]) -> Vec<usize> {
+    ["time", "y", "x"]
+        .iter()
+        .filter_map(|&dimension| {
+            names
                 .iter()
-                .position(|s| s.as_ref().is_some_and(|v| v == "time"))
-                .unwrap_or(0);
-            let x_axis = names
-                .iter()
-                .position(|s| s.as_ref().is_some_and(|v| v == "x"))
-                .unwrap_or(1);
-            let y_axis = names
-                .iter()
-                .position(|s| s.as_ref().is_some_and(|v| v == "y"))
-                .unwrap_or(2);
-            [t_axis, x_axis, y_axis]
-        }
-        None => [0, 1, 2],
-    }
-}
-
-const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
-
-/// Calculates the spatial bounding box of a tile
-pub fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
-    let tile_length = EARTH_CIRCUMFERENCE / f64::from(1_u32 << zoom);
-    let min_x = EARTH_CIRCUMFERENCE * -0.5 + x as f64 * tile_length;
-    let max_y = EARTH_CIRCUMFERENCE * 0.5 - y as f64 * tile_length;
-
-    [min_x, max_y - tile_length, min_x + tile_length, max_y]
+                .position(|name| name.as_deref() == Some(dimension))
+        })
+        .collect()
 }
 
 struct TimeMetadata {
@@ -512,12 +464,36 @@ struct TimeMetadata {
 }
 
 impl TimeMetadata {
+    fn parse_zarr_time_attrs(units: &str, calendar: &str) -> Result<Self, ZarrError> {
+        // split "seconds since 1970-01-01"
+        let parts: Vec<&str> = units.split(" since ").collect();
+        let unit_type = parts[0].to_lowercase();
+
+        // parse the date part
+        let epoch_date =
+            NaiveDate::parse_from_str(parts[1].split(' ').collect::<Vec<_>>()[0], "%Y-%m-%d")
+                .map_err(ZarrError::ParseError)?;
+
+        // convert to UTC DateTime at midnight
+        let epoch_date_time = epoch_date.and_hms_opt(0, 0, 0).ok_or(ZarrError::TimeError(
+            "Can not convert to date time value".into(),
+        ))?;
+        let epoch = Utc.from_utc_datetime(&epoch_date_time);
+
+        Ok(Self {
+            units: unit_type,
+            epoch,
+            _calendar: calendar.to_owned(),
+        })
+    }
+
+    #[allow(clippy::cast_precision_loss)]
     fn datetime_to_raw(&self, val: &DateTime<Utc>) -> f64 {
         let duration = val.signed_duration_since(self.epoch);
-        let secs = duration.num_seconds() as f64;
-        let nanos = duration.subsec_nanos() as f64;
+        let secs = duration.num_seconds();
+        let nanos = i64::from(duration.subsec_nanos());
 
-        let total_seconds = secs + (nanos / 1_000_000_000.0);
+        let total_seconds = secs + (nanos / 1_000_000_000);
 
         let scale = match self.units.as_str() {
             "days" => 1.0 / 86400.0,
@@ -528,79 +504,67 @@ impl TimeMetadata {
             _ => 1.0, // "seconds"
         };
 
-        total_seconds * scale
+        total_seconds as f64 * scale
     }
 
-    fn parse_zarr_time_attrs(units: &str, calendar: &str) -> Result<Self, Box<dyn Error>> {
-        // Split "seconds since 1970-01-01"
-        let parts: Vec<&str> = units.split(" since ").collect();
-        let unit_type = parts[0].to_lowercase();
+    // TODO: parsing
+    async fn get_temporal_index<T: ObjectStore>(
+        time_coords: &Array<AsyncObjectStore<T>>,
+        datetime: DateTime<Utc>,
+    ) -> Result<u64, ZarrError> {
+        // Load time data
+        let data_type = time_coords.data_type();
+        let name = data_type.name(ZarrVersion::V3);
 
-        // Parse the date part
-        let epoch_date =
-            NaiveDate::parse_from_str(parts[1], "%Y-%m-%d").expect("Invalid epoch format");
+        let data_time = match name.as_deref() {
+            Some("float32") => time_coords
+                .async_retrieve_array_subset::<ndarray::Array1<f32>>(&time_coords.subset_all())
+                .await
+                .map_err(ZarrError::ArrayError)?
+                .mapv(f64::from),
+            Some("float64") => time_coords
+                .async_retrieve_array_subset::<ndarray::Array1<f64>>(&time_coords.subset_all())
+                .await
+                .map_err(ZarrError::ArrayError)?,
+            _ => return Err(ZarrError::DimensionError("Data type not supported".into())),
+        };
 
-        // Convert to UTC DateTime at midnight
-        let epoch_date_time = epoch_date
-            .and_hms_opt(0, 0, 0)
-            .ok_or("Can not convert to date time value")?;
-        let epoch = Utc.from_utc_datetime(&epoch_date_time);
+        let units = time_coords.attributes().get("units").and_then(|v| {
+            if v.is_string() {
+                return v.as_str();
+            }
+            None
+        });
 
-        Ok(TimeMetadata {
-            units: unit_type,
-            epoch,
-            _calendar: calendar.to_string(),
-        })
+        let calendar = time_coords.attributes().get("calendar").and_then(|v| {
+            if v.is_string() {
+                return v.as_str();
+            }
+            None
+        });
+
+        let units = units.ok_or(ZarrError::TimeError("Could not get time units".into()))?;
+        let calendar = calendar.ok_or(ZarrError::TimeError(
+            "Could not get calendar metadata".into(),
+        ))?;
+        let time_meta = Self::parse_zarr_time_attrs(units, calendar)?;
+        let val = time_meta.datetime_to_raw(&datetime);
+        let index = find_closest_binary(&data_time, val)? as u64;
+
+        Ok(index)
     }
 }
 
-fn get_temporal_index(
-    time_coords: &Array<FilesystemStore>,
-    datetime: DateTime<Utc>,
-) -> Result<usize, Box<dyn Error>> {
-    // Load time data
-    let data_type = time_coords.data_type();
-    let name = data_type.name(ZarrVersion::V3);
-    let data_time = match name.as_deref() {
-        Some("float32") => time_coords
-            .retrieve_array_subset::<ndarray::Array1<f32>>(&time_coords.subset_all())?
-            .mapv(|v| v as f64),
-        Some("float64") => {
-            time_coords.retrieve_array_subset::<ndarray::Array1<f64>>(&time_coords.subset_all())?
-        }
-        _ => unimplemented!("Data type not implemented yet"),
-    };
+fn find_closest_binary(time_array: &ndarray::Array1<f64>, target: f64) -> Result<usize, ZarrError> {
+    let slice = time_array
+        .as_slice()
+        .ok_or(ZarrError::TimeError("Could not convert to slice".into()))?;
 
-    let units = time_coords.attributes().get("units").and_then(|v| {
-        if v.is_string() {
-            return v.as_str();
-        }
-        None
-    });
-
-    let calendar = time_coords.attributes().get("calendar").and_then(|v| {
-        if v.is_string() {
-            return v.as_str();
-        }
-        None
-    });
-
-    let units = units.ok_or("Could not get time units")?;
-    let calendar = calendar.ok_or("Could not get calendar metadata")?;
-    let time_meta = TimeMetadata::parse_zarr_time_attrs(units, calendar)?;
-    let val = time_meta.datetime_to_raw(&datetime);
-    let index = find_closest_binary(&data_time, val)?;
-
-    Ok(index)
-}
-
-fn find_closest_binary(
-    time_array: &ndarray::Array1<f64>,
-    target: f64,
-) -> Result<usize, Box<dyn Error>> {
-    let slice = time_array.as_slice().ok_or("Could not convert to slice")?;
-
-    match slice.binary_search_by(|probe| probe.partial_cmp(&target).unwrap()) {
+    match slice.binary_search_by(|probe| {
+        probe
+            .partial_cmp(&target)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) {
         Ok(index) => Ok(index),
         Err(index) => {
             // 'index' is the insertion point
@@ -622,38 +586,6 @@ fn find_closest_binary(
         }
     }
 }
-
-// TODO: move blocking CPU bound coord transformation to thread pool
-
-// use rayon::{ThreadPool, ThreadPoolBuilder};
-// use std::sync::{Arc, LazyLock};
-// use tokio::sync::oneshot;
-//
-// // Thread pool initializes automatically on first dereference
-// static REPROJECT_POOL: LazyLock<Arc<ThreadPool>> = LazyLock::new(|| {
-//     let pool = ThreadPoolBuilder::new()
-//         .num_threads(reproject_worker_count())
-//         .thread_name(|i| format!("lazycogs-reproject-{}", i))
-//         .build()
-//         .expect("failed to create reproject thread pool");
-//     Arc::new(pool)
-// });
-//
-// pub async fn run_reproject<F, R>(f: F) -> R
-// where
-//     F: FnOnce() -> R + Send + 'static,
-//     R: Send + 'static,
-// {
-//     let (tx, rx) = oneshot::channel();
-//
-//     // Accessing &*REPROJECT_POOL triggers the lazy initialization on first call
-//     REPROJECT_POOL.spawn(move || {
-//         let res = f();
-//         let _ = tx.send(res);
-//     });
-//
-//     rx.await.expect("worker thread panicked or dropped")
-// }
 
 #[cfg(test)]
 mod tests {

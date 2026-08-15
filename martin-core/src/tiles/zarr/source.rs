@@ -13,21 +13,24 @@ use martin_tile_utils::{Format, TileCoord, TileData, TileInfo};
 use moka::future::Cache;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
-use tilejson::{TileJSON, tilejson};
-use tracing::info;
+use tilejson::{Bounds, TileJSON, tilejson};
 use zarrs::array::Array;
 use zarrs_object_store::AsyncObjectStore;
 
 use crate::CacheZoomRange;
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::utils::{
-    data_variables, get_bbox, get_proj_code, get_spatial_transform, sample_data_var, time_coords,
+    calculate_warp_grid, data_variables, get_bbox, get_proj_code, get_spatial_shape,
+    get_spatial_transform, sample_data_var, time_coords,
 };
-use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
+use crate::tiles::{MartinCoreResult, Source, UrlQuery};
 
 /// Currently no pyramids - therefore full zoom range
 const MIN_ZOOM: u8 = 0;
 const MAX_ZOOM: u8 = 23;
+
+/// Coordinate reference system of Martin tile server
+pub(crate) const TARGET_CRS: &str = "EPSG:3857";
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct WarpCacheKey(TileCoord);
@@ -40,6 +43,7 @@ pub struct WarpCache {
 
 impl WarpCache {
     /// Creates a new warp cache
+    #[must_use]
     pub fn new(
         max_size_bytes: u64,
         expiry: Option<Duration>,
@@ -83,6 +87,7 @@ pub struct ZarrSource<T: ObjectStore> {
     src_crs: String,
     src_bbox: [f64; 4],
     src_transform: [f64; 6],
+    src_shape: [u64; 2],
     cache_zoom: CacheZoomRange,
     warp_cache: WarpCache,
 }
@@ -125,11 +130,24 @@ impl ZarrSource<LocalFileSystem> {
         let src_crs = get_proj_code(Arc::clone(&zarr_store)).await?;
         let src_transform = get_spatial_transform(Arc::clone(&zarr_store)).await?;
         let src_bbox = get_bbox(Arc::clone(&zarr_store)).await?;
+        let src_shape = get_spatial_shape(Arc::clone(&zarr_store)).await?;
+
+        // bounding box in tilejson needs to be in WGS84 - see <https://github.com/mapbox/tilejson-spec/tree/master/3.0.0#35-bounds>
+        let transformer = proj::Proj::try_from((src_crs.as_str(), "EPSG:4326"))
+            .map_err(ZarrError::ProjCreateError)?;
+        let (x_min, y_min) = transformer
+            .convert((src_bbox[0], src_bbox[1]))
+            .map_err(ZarrError::ProjError)?;
+        let (x_max, y_max) = transformer
+            .convert((src_bbox[2], src_bbox[3]))
+            .map_err(ZarrError::ProjError)?;
+        let bounds = Bounds::new(x_min, y_min, x_max, y_max);
 
         let tilejson = tilejson! {
             tiles: vec![],
             minzoom: MIN_ZOOM,
             maxzoom: MAX_ZOOM,
+            bounds: bounds
         };
 
         let warp_cache = WarpCache::new(0, None, None);
@@ -143,12 +161,46 @@ impl ZarrSource<LocalFileSystem> {
             time_coords,
             data_vars: data_vars.into(),
             src_crs,
-            src_bbox,
             src_transform,
+            src_bbox,
+            src_shape,
             cache_zoom,
             warp_cache,
         })
     }
+}
+
+// TODO: move blocking CPU bound coord transformation to thread pool
+
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::sync::LazyLock;
+use tokio::sync::oneshot;
+
+static WARP_POOL: LazyLock<Arc<ThreadPool>> = LazyLock::new(|| {
+    let num_threads =
+        std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1));
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .thread_name(|i| format!("zarr-{i}"))
+        .build()
+        .expect("Failed to create zarr thread pool");
+    Arc::new(pool)
+});
+
+/// Warp Zarr data
+async fn run_warp<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+
+    WARP_POOL.spawn(move || {
+        let res = f();
+        let _ = tx.send(res);
+    });
+
+    rx.await.expect("worker thread panicked or dropped")
 }
 
 #[derive(Debug, Default)]
@@ -188,24 +240,24 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
     async fn get_tile(
         &self,
         xyz: TileCoord,
-        url_query: Option<&UrlQuery>,
+        _url_query: Option<&UrlQuery>,
     ) -> MartinCoreResult<TileData> {
-        let mut query_params = QueryParams::default();
-        if let Some(url_query) = url_query {
-            for (key, value) in url_query {
-                match key.as_str() {
-                    "time" => {
-                        let date_time = DateTime::parse_from_rfc3339(value)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .map_err(ZarrError::ParseError)
-                            .map_err(MartinCoreError::ZarrError)?;
-                        query_params.date_time = Some(date_time);
-                    }
-                    "data_var" => query_params.data_var = Some(value.as_str()),
-                    _ => info!("Query string not supported"),
-                }
-            }
-        }
+        // let mut query_params = QueryParams::default();
+        // if let Some(url_query) = url_query {
+        //     for (key, value) in url_query {
+        //         match key.as_str() {
+        //             "time" => {
+        //                 let date_time = DateTime::parse_from_rfc3339(value)
+        //                     .map(|dt| dt.with_timezone(&Utc))
+        //                     .map_err(ZarrError::ParseError)
+        //                     .map_err(MartinCoreError::ZarrError)?;
+        //                 query_params.date_time = Some(date_time);
+        //             }
+        //             "data_var" => query_params.data_var = Some(value.as_str()),
+        //             _ => info!("Query string not supported"),
+        //         }
+        //     }
+        // }
 
         let time_str = "2026-08-13T00:00:00.000Z";
         let data_var = "/snow_depth";
@@ -213,18 +265,20 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
             let data_var = self.data_vars.get(data_var).expect("msg");
             let datetime = DateTime::parse_from_rfc3339(time_str).expect("msg");
             let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
-            let data = sample_data_var(
-                &xyz,
-                &self.src_crs,
-                self.src_transform,
-                self.src_bbox,
-                self.time_coords.clone(),
-                datetime_utc,
-                data_var,
-            )
-            .await
-            .expect("could not sample data");
-            return Ok(data);
+            let warp_grid =
+                calculate_warp_grid(xyz, self.src_transform, &self.src_crs, self.src_shape)?;
+
+            if let Some((warp_grid, warp_grid_bbox)) = warp_grid {
+                let data = sample_data_var(
+                    warp_grid,
+                    warp_grid_bbox,
+                    self.time_coords.clone(),
+                    datetime_utc,
+                    data_var,
+                )
+                .await?;
+                return Ok(data);
+            }
         }
 
         Ok(Vec::new())
