@@ -1,8 +1,8 @@
 //! Source for Zarr data
 use core::fmt;
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::vec;
@@ -12,18 +12,21 @@ use chrono::{DateTime, Utc};
 use martin_tile_utils::{Format, TileCoord, TileData, TileInfo};
 use moka::future::Cache;
 use object_store::ObjectStore;
-use object_store::local::LocalFileSystem;
+use rayon::{ThreadPool, ThreadPoolBuilder, result};
+use std::sync::LazyLock;
 use tilejson::{Bounds, TileJSON, tilejson};
+use tokio::sync::oneshot;
 use zarrs::array::Array;
 use zarrs_object_store::AsyncObjectStore;
 
 use crate::CacheZoomRange;
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::utils::{
-    TILE_PIXELS, calculate_warp_grid, data_variables, get_bbox, get_proj_code, get_spatial_shape,
-    get_spatial_transform, sample_data_var, time_coords,
+    TILE_PIXELS, WarpGrid, calculate_warp_grid, data_variables, get_bbox, get_fill_value,
+    get_proj_code, get_spatial_registration, get_spatial_shape, get_spatial_transform,
+    retrieve_tile_data, sample_data, time_coords,
 };
-use crate::tiles::{MartinCoreResult, Source, UrlQuery};
+use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
 
 /// Currently no pyramids - therefore full zoom range
 const MIN_ZOOM: u8 = 0;
@@ -35,10 +38,16 @@ pub(crate) const TARGET_CRS: &str = "EPSG:3857";
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct WarpCacheKey(TileCoord);
 
+impl Borrow<TileCoord> for WarpCacheKey {
+    fn borrow(&self) -> &TileCoord {
+        &self.0
+    }
+}
+
 /// Warp cache that stores transformation from tile pixel grid to source pixel grid
 #[derive(Debug, Clone)]
 pub struct WarpCache {
-    cache: Cache<WarpCacheKey, [u32; 1024]>,
+    cache: Cache<WarpCacheKey, Option<WarpGrid>>,
 }
 
 impl WarpCache {
@@ -51,12 +60,17 @@ impl WarpCache {
     ) -> Self {
         let mut builder = Cache::builder()
             .name("zarr_warp_cache")
-            .weigher(|_key: &WarpCacheKey, value: &[u32; 1024]| {
+            .weigher(|_key: &WarpCacheKey, value: &Option<WarpGrid>| {
                 value
-                    .len()
-                    .saturating_mul(size_of::<u32>())
-                    .try_into()
-                    .unwrap_or(u32::MAX)
+                    .as_ref()
+                    .map(|(grid, _)| {
+                        grid.len()
+                            .saturating_mul(size_of::<u32>())
+                            .try_into()
+                            .unwrap_or(u32::MAX)
+                            + 4 * size_of::<u64>() as u32
+                    })
+                    .unwrap_or_default()
             })
             .max_capacity(max_size_bytes);
 
@@ -74,6 +88,12 @@ impl WarpCache {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum SpatialRegistration {
+    Pixel,
+    Node,
+}
+
 /// Tile source that reads from `Zarr` stores
 #[derive(Clone)]
 pub struct ZarrSource<T: ObjectStore> {
@@ -85,9 +105,10 @@ pub struct ZarrSource<T: ObjectStore> {
     time_coords: Option<Arc<Array<AsyncObjectStore<T>>>>,
     data_vars: Arc<HashMap<String, Array<AsyncObjectStore<T>>>>,
     src_crs: String,
-    src_bbox: [f64; 4],
     src_transform: [f64; 6],
     src_shape: [u64; 2],
+    fill_value: f32,
+    spatial_registration: SpatialRegistration,
     cache_zoom: CacheZoomRange,
     warp_cache: WarpCache,
 }
@@ -100,11 +121,11 @@ impl<T: ObjectStore> Debug for ZarrSource<T> {
     }
 }
 
-impl ZarrSource<LocalFileSystem> {
+impl<T: ObjectStore> ZarrSource<T> {
     /// Creates a new Zarr tile source from a file path
     pub async fn async_new(
+        object_store: T,
         id: String,
-        path: PathBuf,
         cache_zoom: CacheZoomRange,
     ) -> Result<Self, ZarrError> {
         let tileinfo = TileInfo::new(
@@ -112,9 +133,9 @@ impl ZarrSource<LocalFileSystem> {
             martin_tile_utils::Encoding::Uncompressed,
         );
 
-        let local_store = LocalFileSystem::new_with_prefix(path.clone())
-            .map_err(|e| ZarrError::OjbectStoreError(e, path))?;
-        let zarr_store = Arc::new(AsyncObjectStore::new(local_store));
+        // let local_store = LocalFileSystem::new_with_prefix(path.clone())
+        //     .map_err(|e| ZarrError::OjbectStoreError(e, path))?;
+        let zarr_store = Arc::new(AsyncObjectStore::new(object_store));
 
         let time_coords = time_coords(Arc::clone(&zarr_store)).await?.map(Arc::new);
 
@@ -131,6 +152,8 @@ impl ZarrSource<LocalFileSystem> {
         let src_transform = get_spatial_transform(Arc::clone(&zarr_store)).await?;
         let src_bbox = get_bbox(Arc::clone(&zarr_store)).await?;
         let src_shape = get_spatial_shape(Arc::clone(&zarr_store)).await?;
+        let fill_value = get_fill_value(Arc::clone(&zarr_store)).await?;
+        let spatial_registration = get_spatial_registration(Arc::clone(&zarr_store)).await?;
 
         // bounding box in tilejson needs to be in WGS84 - see <https://github.com/mapbox/tilejson-spec/tree/master/3.0.0#35-bounds>
         let transformer = proj::Proj::try_from((src_crs.as_str(), "EPSG:4326"))
@@ -162,19 +185,53 @@ impl ZarrSource<LocalFileSystem> {
             data_vars: data_vars.into(),
             src_crs,
             src_transform,
-            src_bbox,
             src_shape,
+            fill_value,
+            spatial_registration,
             cache_zoom,
             warp_cache,
         })
     }
+
+    /// Calculate warp grid
+    async fn run_calculate_warp_grid(&self, xyz: TileCoord) -> Result<Option<WarpGrid>, ZarrError> {
+        let src_transform = self.src_transform;
+        let src_crs = self.src_crs.clone();
+        let src_shape = self.src_shape;
+        let spatial_registration = self.spatial_registration.clone();
+
+        run_on_rayon(move || {
+            calculate_warp_grid(
+                xyz,
+                src_transform,
+                &src_crs,
+                src_shape,
+                &spatial_registration,
+            )
+        })
+        .await?
+    }
+
+    /// Sample data at warp grid points
+    async fn run_sample_data(
+        &self,
+        warp_grid: Box<[i64]>,
+        warp_grid_bbox: [u64; 4],
+        tile_data: ndarray::Array3<f32>,
+    ) -> Result<Vec<u8>, ZarrError> {
+        let fill_value = self.fill_value;
+        run_on_rayon(move || {
+            sample_data(
+                &warp_grid,
+                warp_grid_bbox,
+                tile_data,
+                TILE_PIXELS,
+                fill_value,
+            )
+        })
+        .await?
+    }
 }
-
-// TODO: move blocking CPU bound coord transformation to thread pool
-
-use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::sync::LazyLock;
-use tokio::sync::oneshot;
 
 static WARP_POOL: LazyLock<Arc<ThreadPool>> = LazyLock::new(|| {
     let num_threads =
@@ -187,20 +244,20 @@ static WARP_POOL: LazyLock<Arc<ThreadPool>> = LazyLock::new(|| {
     Arc::new(pool)
 });
 
-/// Warp Zarr data
-async fn run_warp<F, R>(f: F) -> R
+async fn run_on_rayon<R, F>(f: F) -> Result<R, ZarrError>
 where
-    F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
 {
     let (tx, rx) = oneshot::channel();
 
     WARP_POOL.spawn(move || {
-        let res = f();
-        let _ = tx.send(res);
+        let result = f();
+        let _ = tx.send(result);
     });
 
-    rx.await.expect("worker thread panicked or dropped")
+    rx.await
+        .map_err(|_err_| ZarrError::WarpError("Rayon worker dropped".into()))
 }
 
 #[derive(Debug, Default)]
@@ -261,28 +318,36 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
 
         let time_str = "2026-08-13T00:00:00.000Z";
         let data_var = "/snow_depth";
+
         if xyz.z >= self.min_zoom && xyz.z <= self.max_zoom {
             let data_var = self.data_vars.get(data_var).expect("msg");
-            let datetime = DateTime::parse_from_rfc3339(time_str).expect("msg");
-            let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
-            let warp_grid =
-                calculate_warp_grid(xyz, self.src_transform, &self.src_crs, self.src_shape)?;
+            let datetime = DateTime::parse_from_rfc3339(time_str)
+                .expect("msg")
+                .with_timezone(&Utc);
 
-            if let Some((warp_grid, warp_grid_bbox)) = warp_grid {
-                let data = sample_data_var(
-                    warp_grid,
-                    warp_grid_bbox,
-                    self.time_coords.clone(),
-                    datetime_utc,
-                    data_var,
-                    TILE_PIXELS,
-                )
-                .await?;
-                return Ok(data);
-            }
+            let warp_grid = self
+                .warp_cache
+                .cache
+                .get_with(WarpCacheKey(xyz), async {
+                    self.run_calculate_warp_grid(xyz).await.ok()?
+                })
+                .await;
+
+            let Some((warp_grid, warp_grid_bbox)) = warp_grid else {
+                return Ok(vec![]);
+            };
+
+            let tile_data =
+                retrieve_tile_data(warp_grid_bbox, self.time_coords.clone(), datetime, data_var)
+                    .await?;
+
+            return self
+                .run_sample_data(warp_grid, warp_grid_bbox, tile_data)
+                .await
+                .map_err(MartinCoreError::ZarrError);
         }
 
-        Ok(Vec::new())
+        Ok(vec![])
     }
 }
 

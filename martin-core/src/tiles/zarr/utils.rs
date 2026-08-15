@@ -17,14 +17,13 @@ use zarrs::{
 };
 
 use crate::tiles::zarr::error::ZarrError;
-use crate::tiles::zarr::source::TARGET_CRS;
+use crate::tiles::zarr::source::{SpatialRegistration, TARGET_CRS};
 
 pub(crate) const TILE_PIXELS: u32 = 512;
-const GRID_SIZE: usize = (2 * TILE_PIXELS * TILE_PIXELS) as usize;
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
 
 /// Calculates the spatial bounding box of a tile
-pub fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
+pub(crate) fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
     let tile_length = EARTH_CIRCUMFERENCE / f64::from(1_u32 << zoom);
     let min_x = EARTH_CIRCUMFERENCE * -0.5 + f64::from(x) * tile_length;
     let max_y = EARTH_CIRCUMFERENCE * 0.5 - f64::from(y) * tile_length;
@@ -33,7 +32,7 @@ pub fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
 }
 
 /// Retrieve all data variables of this store - arrays that are not dimensions
-pub async fn data_variables<T: ObjectStore>(
+pub(crate) async fn data_variables<T: ObjectStore>(
     store: Arc<AsyncObjectStore<T>>,
 ) -> Result<Vec<NodePath>, ZarrError> {
     let root_path = NodePath::root();
@@ -49,7 +48,9 @@ pub async fn data_variables<T: ObjectStore>(
 }
 
 /// Retrieve time variable
-pub async fn time_coords<S: AsyncReadableStorageTraits + AsyncListableStorageTraits + 'static>(
+pub(crate) async fn time_coords<
+    S: AsyncReadableStorageTraits + AsyncListableStorageTraits + 'static,
+>(
     store: Arc<S>,
 ) -> Result<Option<Array<S>>, ZarrError> {
     let root_path = NodePath::root();
@@ -101,7 +102,7 @@ fn is_data_variable(node: &Node) -> Result<bool, ZarrError> {
 }
 
 /// Get coordinate system definition as EPSG code
-pub async fn get_proj_code<T: ObjectStore>(
+pub(crate) async fn get_proj_code<T: ObjectStore>(
     store: Arc<AsyncObjectStore<T>>,
 ) -> Result<String, ZarrError> {
     let root_group = Group::async_open(store, NodePath::root().as_str())
@@ -117,7 +118,7 @@ pub async fn get_proj_code<T: ObjectStore>(
 }
 
 /// Get the affine transformation from pixel space to geographic space
-pub async fn get_spatial_transform<T: ObjectStore>(
+pub(crate) async fn get_spatial_transform<T: ObjectStore>(
     store: Arc<AsyncObjectStore<T>>,
 ) -> Result<[f64; 6], ZarrError> {
     let root_group = Group::async_open(store, NodePath::root().as_str())
@@ -134,41 +135,81 @@ pub async fn get_spatial_transform<T: ObjectStore>(
 }
 
 /// Get the bounding box
-pub async fn get_bbox<T: ObjectStore>(
+pub(crate) async fn get_bbox<T: ObjectStore>(
     store: Arc<AsyncObjectStore<T>>,
 ) -> Result<[f64; 4], ZarrError> {
     let root_group = Group::async_open(store, NodePath::root().as_str())
         .await
         .map_err(ZarrError::GroupCreateError)?;
 
-    let transform_value = root_group
+    let bbox = root_group
         .attributes()
         .get("spatial:bbox")
         .ok_or_else(|| ZarrError::AttributeError("spatial:transform is missing".into()))?;
 
-    serde_json::from_value::<[f64; 4]>(transform_value.clone())
+    serde_json::from_value::<[f64; 4]>(bbox.clone())
         .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:transform format: {e}")))
 }
 
 /// Get the shape of the source array
-pub async fn get_spatial_shape<T: ObjectStore>(
+pub(crate) async fn get_spatial_shape<T: ObjectStore>(
     store: Arc<AsyncObjectStore<T>>,
 ) -> Result<[u64; 2], ZarrError> {
     let root_group = Group::async_open(store, NodePath::root().as_str())
         .await
         .map_err(ZarrError::GroupCreateError)?;
 
-    let transform_value = root_group
+    let spatial_shape = root_group
         .attributes()
         .get("spatial:shape")
         .ok_or_else(|| ZarrError::AttributeError("spatial:shape is missing".into()))?;
 
-    serde_json::from_value::<[u64; 2]>(transform_value.clone())
+    serde_json::from_value::<[u64; 2]>(spatial_shape.clone())
         .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:shape format: {e}")))
 }
 
+/// Get the fill value of the source array
+pub(crate) async fn get_fill_value<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<f32, ZarrError> {
+    let root_group = Group::async_open(store, NodePath::root().as_str())
+        .await
+        .map_err(ZarrError::GroupCreateError)?;
+
+    let fill_value = root_group
+        .attributes()
+        .get("fill_value")
+        .ok_or_else(|| ZarrError::AttributeError("fill_value is missing".into()))?;
+
+    serde_json::from_value::<f32>(fill_value.clone())
+        .map_err(|e| ZarrError::AttributeError(format!("Missing fill_value: {e}")))
+}
+
+/// Get the spatial registration of the source array
+pub(crate) async fn get_spatial_registration<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<SpatialRegistration, ZarrError> {
+    let root_group = Group::async_open(store, NodePath::root().as_str())
+        .await
+        .map_err(ZarrError::GroupCreateError)?;
+
+    let registration = root_group
+        .attributes()
+        .get("spatial:registration")
+        .and_then(|val| val.as_str())
+        .ok_or_else(|| ZarrError::AttributeError("spatial:registration is missing".into()))?;
+
+    match registration {
+        "node" => Ok(SpatialRegistration::Node),
+        "pixel" => Ok(SpatialRegistration::Pixel),
+        _ => Err(ZarrError::AttributeError(format!(
+            "invalid value for spatial:registration: {registration}"
+        ))),
+    }
+}
+
 /// Returns the names of the spatial dimensions
-pub fn _get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
+pub(crate) fn _get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
     array
         .attributes()
         .get("spatial:dimensions")
@@ -177,7 +218,7 @@ pub fn _get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
 }
 
 /// Returns the names of non-spatial dimensions
-pub fn _get_non_spatial_dims(
+pub(crate) fn _get_non_spatial_dims(
     array: &Array<FilesystemStore>,
     spatial_dims: &Vec<&str>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
@@ -200,14 +241,12 @@ pub fn _get_non_spatial_dims(
 }
 
 /// Sample from array using a warp-grid
-pub async fn sample_data_var<T: ObjectStore>(
-    warp_grid: Box<[i64]>,
+pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
     warp_grid_bbox: [u64; 4],
     time_coords: Option<Arc<Array<AsyncObjectStore<T>>>>,
     datetime: DateTime<Utc>,
     data_var: &Array<AsyncObjectStore<T>>,
-    tile_len: u32,
-) -> Result<Vec<u8>, ZarrError> {
+) -> Result<ndarray::Array3<f32>, ZarrError> {
     // get time index
     let mut time_range = None;
     if let Some(arr) = time_coords {
@@ -260,9 +299,20 @@ pub async fn sample_data_var<T: ObjectStore>(
         }
     };
 
+    Ok(tile_data)
+}
+
+/// Sample the data at the warp grid points
+pub(crate) fn sample_data(
+    warp_grid: &[i64],
+    warp_grid_bbox: [u64; 4],
+    tile_data: ndarray::Array3<f32>,
+    tile_len: u32,
+    fill_value: f32,
+) -> Result<Vec<u8>, ZarrError> {
     // sample from array at warp grid points
     let (sampled_data, _min, _max) =
-        sample_warp_grid(&warp_grid, warp_grid_bbox, &tile_data, tile_len)?;
+        sample_warp_grid(&warp_grid, warp_grid_bbox, &tile_data, tile_len, fill_value)?;
 
     // cast to raw bytes
     let raw_bytes = bytemuck::cast_slice::<f32, u8>(&sampled_data);
@@ -272,16 +322,17 @@ pub async fn sample_data_var<T: ObjectStore>(
     Ok(compressed_bytes)
 }
 
-// TODO: use no-data value
 fn sample_warp_grid(
     warp_grid: &[i64],
     warp_grid_bbox: [u64; 4],
     tile_data: &ndarray::Array3<f32>,
     tile_len: u32,
+    fill_value: f32,
 ) -> Result<(Box<[f32]>, f32, f32), ZarrError> {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
-    let mut sampled_data = vec![f32::NAN; tile_len as usize * tile_len as usize].into_boxed_slice();
+    let mut sampled_data =
+        vec![fill_value; tile_len as usize * tile_len as usize].into_boxed_slice();
 
     for i in 0..tile_len {
         for j in 0..tile_len {
@@ -323,13 +374,14 @@ fn sample_warp_grid(
     Ok((sampled_data, min, max))
 }
 
-type WarpGrid = (Box<[i64]>, [u64; 4]);
+pub(crate) type WarpGrid = (Box<[i64]>, [u64; 4]);
 
 pub(crate) fn calculate_warp_grid(
     tile: TileCoord,
     src_transform: [f64; 6],
     src_crs: &str,
     src_shape: [u64; 2],
+    spatial_registration: &SpatialRegistration,
 ) -> Result<Option<WarpGrid>, ZarrError> {
     calculate_warp_grid_for_bbox(
         tile_bbox(tile.x, tile.y, tile.z),
@@ -338,6 +390,7 @@ pub(crate) fn calculate_warp_grid(
         src_crs,
         src_shape,
         TILE_PIXELS,
+        spatial_registration,
     )
 }
 
@@ -348,6 +401,7 @@ fn calculate_warp_grid_for_bbox(
     src_crs: &str,
     src_shape: [u64; 2],
     tile_len: u32,
+    spatial_registration: &SpatialRegistration,
 ) -> Result<Option<WarpGrid>, ZarrError> {
     // inverse affine transformation from spatial coordinate system to pixel grid
     let src_inv_affine = inverse_affine(src_transform);
@@ -388,10 +442,27 @@ fn calculate_warp_grid_for_bbox(
                 .convert((x_target, y_target))
                 .map_err(ZarrError::ProjError)?;
 
-            let right =
-                (src_inv_affine[0] * x_src + src_inv_affine[1] * y_src + src_inv_affine[2]).round();
-            let down =
-                (src_inv_affine[3] * x_src + src_inv_affine[4] * y_src + src_inv_affine[5]).round();
+            let right = match spatial_registration {
+                SpatialRegistration::Pixel => {
+                    (src_inv_affine[0] * x_src + src_inv_affine[1] * y_src + src_inv_affine[2])
+                        .floor()
+                }
+                SpatialRegistration::Node => {
+                    (src_inv_affine[0] * x_src + src_inv_affine[1] * y_src + src_inv_affine[2])
+                        .round()
+                }
+            };
+
+            let down = match spatial_registration {
+                SpatialRegistration::Pixel => {
+                    (src_inv_affine[3] * x_src + src_inv_affine[4] * y_src + src_inv_affine[5])
+                        .floor()
+                }
+                SpatialRegistration::Node => {
+                    (src_inv_affine[3] * x_src + src_inv_affine[4] * y_src + src_inv_affine[5])
+                        .round()
+                }
+            };
 
             #[allow(clippy::cast_possible_truncation)]
             let right = if (0.0..width).contains(&right) {
@@ -438,6 +509,7 @@ fn calculate_warp_grid_for_bbox(
     )))
 }
 
+/// Calculate inverse affine transformation
 fn inverse_affine(transform: [f64; 6]) -> [f64; 6] {
     let src_a = transform[0];
     let src_b = transform[1];
@@ -679,6 +751,7 @@ mod tests {
             "EPSG:4326",
             [4, 4],
             4,
+            &SpatialRegistration::Pixel,
         )
         .expect("could not calculate warp grid")
         .expect("should be some");
@@ -695,6 +768,7 @@ mod tests {
             "EPSG:4326",
             [4, 4],
             4,
+            &SpatialRegistration::Pixel,
         )
         .expect("could not calculate warp grid");
 
@@ -702,11 +776,11 @@ mod tests {
             result,
             Some((
                 vec![
-                    1, 1, 1, 2, 1, 3, 1, -1, 2, 1, 2, 2, 2, 3, 2, -1, 3, 1, 3, 2, 3, 3, 3, -1, -1,
-                    1, -1, 2, -1, 3, -1, -1
+                    0, 0, 0, 1, 0, 2, 0, 3, 1, 0, 1, 1, 1, 2, 1, 3, 2, 0, 2, 1, 2, 2, 2, 3, 3, 0,
+                    3, 1, 3, 2, 3, 3
                 ]
                 .into_boxed_slice(),
-                [1, 3, 3, 1]
+                [0, 3, 3, 0]
             ))
         );
     }
@@ -720,10 +794,37 @@ mod tests {
             "EPSG:4326",
             [4, 4],
             4,
+            &SpatialRegistration::Pixel,
         )
         .expect("could not calculate warp grid");
 
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_warp_grid_partial() {
+        let result = calculate_warp_grid_for_bbox(
+            [2.0, 2.0, 5.0, 5.0],
+            "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            "EPSG:4326",
+            [4, 4],
+            4,
+            &SpatialRegistration::Pixel,
+        )
+        .expect("could not calculate warp grid");
+
+        assert_eq!(
+            result,
+            Some((
+                vec![
+                    2, 2, 2, 3, 2, 3, 2, -1, 3, 2, 3, 3, 3, 3, 3, -1, 3, 2, 3, 3, 3, 3, 3, -1, -1,
+                    2, -1, 3, -1, 3, -1, -1
+                ]
+                .into_boxed_slice(),
+                [2, 3, 3, 2]
+            ))
+        );
     }
 
     #[test]
@@ -743,41 +844,17 @@ mod tests {
             "EPSG:4326",
             [4, 4],
             4,
+            &SpatialRegistration::Pixel,
         )
         .expect("could not calculate warp grid")
         .expect("should be some");
 
-        let (sampled_data, min, max) = sample_warp_grid(&warp_grid, warp_grid_bbox, &data, 4)
+        let (sampled_data, min, max) = sample_warp_grid(&warp_grid, warp_grid_bbox, &data, 4, 0.0)
             .expect("could not calculate warp grid");
 
         assert_eq!(sampled_data[6], 12.0);
         assert_eq!(min, 0.0);
         assert_eq!(max, 22.0);
-    }
-
-    #[test]
-    fn test_warp_grid_partial() {
-        let result = calculate_warp_grid_for_bbox(
-            [2.0, 2.0, 5.0, 5.0],
-            "EPSG:4326",
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            "EPSG:4326",
-            [4, 4],
-            4,
-        )
-        .expect("could not calculate warp grid");
-
-        assert_eq!(
-            result,
-            Some((
-                vec![
-                    2, 2, 2, 3, 2, -1, 2, -1, 3, 2, 3, 3, 3, -1, 3, -1, -1, 2, -1, 3, -1, -1, -1,
-                    -1, -1, 2, -1, 3, -1, -1, -1, -1
-                ]
-                .into_boxed_slice(),
-                [2, 3, 3, 2]
-            ))
-        );
     }
 
     // 10/558/356
@@ -801,10 +878,15 @@ mod tests {
         let src_bbox = get_bbox(Arc::clone(&store)).await.unwrap();
         let src_shape = get_spatial_shape(Arc::clone(&store)).await.unwrap();
         let src_crs = get_proj_code(Arc::clone(&store)).await.unwrap();
-        let (warp_grid, warp_grid_bbox) =
-            calculate_warp_grid(tile, src_transform, src_crs.as_str(), src_shape)
-                .expect("could not calculate warp grid")
-                .expect("should be some");
+        let (warp_grid, warp_grid_bbox) = calculate_warp_grid(
+            tile,
+            src_transform,
+            src_crs.as_str(),
+            src_shape,
+            &SpatialRegistration::Pixel,
+        )
+        .expect("could not calculate warp grid")
+        .expect("should be some");
         let res = sample_data_var(
             warp_grid,
             warp_grid_bbox,
@@ -812,6 +894,7 @@ mod tests {
             datetime_utc,
             &data_var,
             TILE_PIXELS,
+            0.0,
         )
         .await;
         assert!(res.is_ok());

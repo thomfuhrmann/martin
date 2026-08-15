@@ -51,4 +51,7 @@ pub enum ZarrError {
     /// Cast error
     #[error("Cast error: {0}")]
     CastError(String),
+    /// Warp error
+    #[error("Warp error: {0}")]
+    WarpError(String),
 }
