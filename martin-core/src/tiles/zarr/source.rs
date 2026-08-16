@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use martin_tile_utils::{Format, TileCoord, TileData, TileInfo};
 use moka::future::Cache;
 use object_store::ObjectStore;
-use rayon::{ThreadPool, ThreadPoolBuilder, result};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::LazyLock;
 use tilejson::{Bounds, TileJSON, tilejson};
 use tokio::sync::oneshot;
@@ -35,6 +35,7 @@ const MAX_ZOOM: u8 = 23;
 /// Coordinate reference system of Martin tile server
 pub(crate) const TARGET_CRS: &str = "EPSG:3857";
 
+// TODO: add src crs to key
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct WarpCacheKey(TileCoord);
 
@@ -58,6 +59,7 @@ impl WarpCache {
         expiry: Option<Duration>,
         idle_timeout: Option<Duration>,
     ) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
         let mut builder = Cache::builder()
             .name("zarr_warp_cache")
             .weigher(|_key: &WarpCacheKey, value: &Option<WarpGrid>| {
@@ -224,7 +226,7 @@ impl<T: ObjectStore> ZarrSource<T> {
             sample_data(
                 &warp_grid,
                 warp_grid_bbox,
-                tile_data,
+                &tile_data,
                 TILE_PIXELS,
                 fill_value,
             )
@@ -260,11 +262,11 @@ where
         .map_err(|_err_| ZarrError::WarpError("Rayon worker dropped".into()))
 }
 
-#[derive(Debug, Default)]
-struct QueryParams<'a> {
-    date_time: Option<DateTime<Utc>>,
-    data_var: Option<&'a str>,
-}
+// #[derive(Debug, Default)]
+// struct QueryParams<'a> {
+//     date_time: Option<DateTime<Utc>>,
+//     data_var: Option<&'a str>,
+// }
 
 #[async_trait]
 impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
@@ -341,10 +343,12 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                 retrieve_tile_data(warp_grid_bbox, self.time_coords.clone(), datetime, data_var)
                     .await?;
 
-            return self
+            let sampled_data = self
                 .run_sample_data(warp_grid, warp_grid_bbox, tile_data)
                 .await
-                .map_err(MartinCoreError::ZarrError);
+                .map_err(MartinCoreError::ZarrError)?;
+
+            return Ok(sampled_data);
         }
 
         Ok(vec![])

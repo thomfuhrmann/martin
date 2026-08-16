@@ -1,12 +1,11 @@
 use chrono::{DateTime, NaiveDate, TimeZone as _, Utc};
 use core::f64;
-use object_store::ObjectStore;
-use zarrs::node::async_get_child_nodes;
-use zarrs_object_store::AsyncObjectStore;
-use zstd::encode_all;
-// use image::{ImageBuffer, LumaA};
+use image::ImageFormat;
 use martin_tile_utils::TileCoord;
+use object_store::ObjectStore;
+use std::io::Cursor;
 use std::{error::Error, ops::Range, sync::Arc};
+use zarrs::node::async_get_child_nodes;
 use zarrs::storage::{AsyncListableStorageTraits, AsyncReadableStorageTraits};
 use zarrs::{
     array::{Array, ArrayMetadata, DimensionName},
@@ -15,6 +14,8 @@ use zarrs::{
     node::{Node, NodeMetadata, NodePath},
     plugin::ZarrVersion,
 };
+use zarrs_object_store::AsyncObjectStore;
+// use zstd::encode_all;
 
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::source::{SpatialRegistration, TARGET_CRS};
@@ -306,20 +307,22 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
 pub(crate) fn sample_data(
     warp_grid: &[i64],
     warp_grid_bbox: [u64; 4],
-    tile_data: ndarray::Array3<f32>,
+    tile_data: &ndarray::Array3<f32>,
     tile_len: u32,
     fill_value: f32,
 ) -> Result<Vec<u8>, ZarrError> {
     // sample from array at warp grid points
-    let (sampled_data, _min, _max) =
-        sample_warp_grid(&warp_grid, warp_grid_bbox, &tile_data, tile_len, fill_value)?;
+    let (sampled_data, min, max) =
+        sample_warp_grid(warp_grid, warp_grid_bbox, tile_data, tile_len, fill_value)?;
 
     // cast to raw bytes
-    let raw_bytes = bytemuck::cast_slice::<f32, u8>(&sampled_data);
+    // let raw_bytes = bytemuck::cast_slice::<f32, u8>(&sampled_data);
 
-    // compress with Zstd
-    let compressed_bytes = encode_all(raw_bytes, 3).map_err(ZarrError::EncodeError)?;
-    Ok(compressed_bytes)
+    // // compress with Zstd
+    // let compressed_bytes = encode_all(raw_bytes, 3).map_err(ZarrError::EncodeError)?;
+    // Ok(compressed_bytes)
+
+    sampled_data_to_png(&sampled_data, TILE_PIXELS, TILE_PIXELS, min, max)
 }
 
 fn sample_warp_grid(
@@ -372,6 +375,43 @@ fn sample_warp_grid(
     }
 
     Ok((sampled_data, min, max))
+}
+
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation)]
+fn sampled_data_to_png(
+    sampled_data: &[f32],
+    width: u32,
+    height: u32,
+    min: f32,
+    max: f32,
+) -> Result<Vec<u8>, ZarrError> {
+    let mut image = image::RgbaImage::new(width, height);
+
+    let range = max - min;
+
+    for (i, &value) in sampled_data.iter().enumerate() {
+        let pixel = if value.is_nan() {
+            [0, 0, 0, 0] // transparent
+        } else {
+            let v = (((value - min) / range) * 255.0).clamp(0.0, 255.0) as u8;
+
+            [v, v, v, 255]
+        };
+
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+
+        image.put_pixel(x, y, image::Rgba(pixel));
+    }
+
+    let mut bytes = Cursor::new(Vec::new());
+
+    image
+        .write_to(&mut bytes, ImageFormat::Png)
+        .map_err(ZarrError::ImageError)?;
+
+    Ok(bytes.into_inner())
 }
 
 pub(crate) type WarpGrid = (Box<[i64]>, [u64; 4]);

@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use image::ImageError;
+
 /// Errors that can occur when working with Zarr stores
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
@@ -54,4 +56,7 @@ pub enum ZarrError {
     /// Warp error
     #[error("Warp error: {0}")]
     WarpError(String),
+    /// Image error
+    #[error("Image error: {0}")]
+    ImageError(ImageError),
 }
