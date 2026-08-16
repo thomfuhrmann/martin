@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-use std::io::Cursor;
-=======
 use std::sync::Arc;
->>>>>>> upstream/main
 
 use actix_http::ContentEncoding;
 use actix_http::header::Quality;
@@ -14,12 +10,7 @@ use actix_web::http::header::{
 use actix_web::web::{Data, Path, Query};
 use actix_web::{HttpMessage as _, HttpRequest, HttpResponse, Result as ActixResult, route};
 use futures::future::try_join_all;
-<<<<<<< HEAD
-use futures::stream::TryConcat;
-use martin_core::tiles::{BoxedSource, OptTileCache, Tile, TileCache, UrlQuery};
-=======
 use martin_core::tiles::{BoxedSource, MartinCoreError, Tile, TileCache, UrlQuery};
->>>>>>> upstream/main
 use martin_tile_utils::{
     Encoding, Format, TileCoord, TileInfo, decode_brotli, decode_gzip, decode_zlib, decode_zstd,
     encode_brotli_with_quality, encode_gzip, encode_zlib, encode_zstd,
@@ -673,16 +664,6 @@ fn encode(tile: Tile, enc: ContentEncoding) -> ActixResult<Tile> {
             tile.info.encoding(Encoding::Brotli),
             etag,
         ),
-<<<<<<< HEAD
-        ContentEncoding::Gzip => {
-            Tile::new_hash_etag(encode_gzip(&tile.data)?, tile.info.encoding(Encoding::Gzip))
-        }
-        ContentEncoding::Zstd => Tile::new_hash_etag(
-            zstd::encode_all(&tile.data[..], 3)?,
-            tile.info.encoding(Encoding::Zstd),
-        ),
-        _ => tile,
-=======
         ContentEncoding::Gzip => Tile::new_with_etag(
             encode_gzip(&tile.data)?,
             tile.info.encoding(Encoding::Gzip),
@@ -699,7 +680,6 @@ fn encode(tile: Tile, enc: ContentEncoding) -> ActixResult<Tile> {
             etag,
         ),
         _ => Tile::new_with_etag(tile.data, tile.info, etag),
->>>>>>> upstream/main
     })
 }
 
@@ -719,15 +699,6 @@ pub(crate) fn decode(tile: Tile) -> ActixResult<Tile> {
                 info.encoding(Encoding::Uncompressed),
                 etag,
             ),
-<<<<<<< HEAD
-            Encoding::Zstd => Tile::new_hash_etag(
-                zstd::decode_all(Cursor::new(&tile.data))?,
-                info.encoding(Encoding::Uncompressed),
-            ),
-            _ => Err(ErrorBadRequest(format!(
-                "Tile is is stored as {info}, but the client does not accept this encoding"
-            )))?,
-=======
             Encoding::Zlib => Tile::new_with_etag(
                 decode_zlib(&tile.data)?,
                 info.encoding(Encoding::Uncompressed),
@@ -743,7 +714,6 @@ pub(crate) fn decode(tile: Tile) -> ActixResult<Tile> {
                     "Tile is stored as {info}, but the client does not accept this encoding"
                 )));
             }
->>>>>>> upstream/main
         }
     } else {
         tile
@@ -755,13 +725,8 @@ pub fn to_encoding(val: ContentEncoding) -> Option<Encoding> {
         ContentEncoding::Identity => Encoding::Uncompressed,
         ContentEncoding::Gzip => Encoding::Gzip,
         ContentEncoding::Brotli => Encoding::Brotli,
-<<<<<<< HEAD
-        ContentEncoding::Zstd => Encoding::Zstd,
-        // TODO: Deflate => Encoding::Zstd or Encoding::Zlib ?
-=======
         ContentEncoding::Deflate => Encoding::Zlib,
         ContentEncoding::Zstd => Encoding::Zstd,
->>>>>>> upstream/main
         _ => None?,
     })
 }
