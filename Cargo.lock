@@ -5682,9 +5682,9 @@ dependencies = [
 
 [[package]]
 name = "monostate"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb4cc965c89dd0615a9e822ff8002f7633d2466143d51bd58693e4b2c75aabad"
+checksum = "fdc4dfdf312bb1b22fce127237589f4ee31652bc479f3d208332f32132aaccc9"
 dependencies = [
  "monostate-impl",
  "serde",
@@ -5693,13 +5693,13 @@ dependencies = [
 
 [[package]]
 name = "monostate-impl"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f5b99488110875b5904839d396c2cdfaf241ff6622638acb879cc7effad5de"
+checksum = "a656449eeb444c77364a3033f013c51869eee320c0dff805eb53024c0dfd435b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -6973,9 +6973,9 @@ dependencies = [
 
 [[package]]
 name = "quick_cache"
-version = "0.6.18"
+version = "0.6.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ada44a88ef953a3294f6eb55d2007ba44646015e18613d2f213016379203ef3"
+checksum = "b9c6658afe513a3b484e3abfdaa0d03ef3c0bbf017542c178dd55f94eb3051f9"
 dependencies = [
  "ahash 0.8.12",
  "equivalent",
@@ -6996,7 +6996,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -8092,7 +8092,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af2c6921c8ce48fb1b052b457619d008834039d80325992ed3bc55bbe6c155ad"
 dependencies = [
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.23.1",
  "encoding_rs_io",
  "granit-parser",
  "miette",
@@ -9004,7 +9004,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -10830,9 +10830,9 @@ dependencies = [
 
 [[package]]
 name = "zarrs"
-version = "0.23.13"
+version = "0.23.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8132307b8fc041fd21f68c7987103fb6e038b11f9838c16ec43b798f5480ccf5"
+checksum = "fbd6697e73e803a80f182036563038ccfaf7fca1b71fc510cce65daaa45478f8"
 dependencies = [
  "async-generic",
  "async-lock",
@@ -10951,14 +10951,15 @@ dependencies = [
 
 [[package]]
 name = "zarrs_filesystem"
-version = "0.3.9"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "270efeb0181651aee5460b3232f2fc83e91bd646cefe75001d1c8f9a4f3abf81"
+checksum = "32d9010e13dcde15100ba7eea4ca8af34521110782ed0eeb170e7ca872ac786d"
 dependencies = [
  "bytes",
  "derive_more 2.1.1",
  "itertools 0.14.0",
  "libc",
+ "lru 0.16.4",
  "page_size",
  "pathdiff",
  "positioned-io",
@@ -10969,9 +10970,9 @@ dependencies = [
 
 [[package]]
 name = "zarrs_metadata"
-version = "0.7.3"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca4803ddc00eb68aa51de6fd6904e8d71e5b7d28b7b077d8d69cba97160fd037"
+checksum = "d60c4c363a8a302d7babb3c29017850a7b4e0af6ca5f9ba2946263a185b62fea"
 dependencies = [
  "derive_more 2.1.1",
  "half",

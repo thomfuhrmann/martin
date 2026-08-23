@@ -1,4 +1,5 @@
 pub mod error;
 pub use error::ZarrError;
+pub mod cache;
 pub mod source;
-mod utils;
+pub(crate) mod utils;

@@ -241,7 +241,7 @@ pub(crate) fn _get_non_spatial_dims(
     Ok(non_spatial)
 }
 
-/// Sample from array using a warp-grid
+/// Retrieve tile data from array
 pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
     warp_grid_bbox: [u64; 4],
     time_coords: Option<Arc<Array<AsyncObjectStore<T>>>>,
@@ -549,7 +549,7 @@ fn calculate_warp_grid_for_bbox(
     )))
 }
 
-/// Calculate inverse affine transformation
+/// Calculates inverse affine transformation
 fn inverse_affine(transform: [f64; 6]) -> [f64; 6] {
     let src_a = transform[0];
     let src_b = transform[1];
@@ -568,6 +568,7 @@ fn inverse_affine(transform: [f64; 6]) -> [f64; 6] {
     ]
 }
 
+/// Helper function for ranges used in fetching the data
 fn build_ranges(
     dimension_names: &[DimensionName],
     time: Option<&Range<u64>>,
@@ -600,6 +601,8 @@ fn order_dimensions(names: &[DimensionName]) -> Vec<usize> {
         .collect()
 }
 
+/// Metadata for temporal units and epoch
+#[derive(Debug)]
 struct TimeMetadata {
     units: String,
     epoch: DateTime<Utc>,
@@ -698,6 +701,7 @@ impl TimeMetadata {
     }
 }
 
+/// Binary search helper function
 fn find_closest_binary(time_array: &ndarray::Array1<f64>, target: f64) -> Result<usize, ZarrError> {
     let slice = time_array
         .as_slice()

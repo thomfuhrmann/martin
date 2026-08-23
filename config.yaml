@@ -7,8 +7,6 @@ listen_addresses: '0.0.0.0:3000'
 # Number of web server workers
 worker_processes: 8
 
-# Amount of memory (in MB) to use for caching tiles [default: 512, 0 to disable]
-cache_size_mb: 512
 
 # CORS Configuration
 #
@@ -23,15 +21,28 @@ cors:
   # null means not setting the header for preflight requests
   max_age: null
 
-#pmtiles:
-#  sources:
-#    gu_keys: "C:/Users/fuhtho/Daten/GU_Keys/gu_keys.pmtiles"
 
-mbtiles:
-  sources:
-    gu_keys: "C:/Users/fuhtho/Daten/GU_Keys/gu_keys.mbtiles"
+# Cache configuration
+cache:
+  # Amount of memory (in MB) to use for caching [default: 512, 0 to disable]
+  size_mb: 8
+  # Default zoom-level bounds for tile caching
+  minzoom: 0
+  maxzoom: 23
 
-cog:
+# Advanced monitoring options
+observability:
+  # Configure metrics reported under `/_/metrics`
+  metrics:
+    # Add these labels to every metric
+    # Example: `{ env: prod, server: martin }`
+    add_labels: {}
+
+
+pmtiles:
   sources:
-      gk50: "C:/Users/fuhtho/Daten/GK50_Kartenfelder_EPSG3857/cog/mosaic_cog.tif"
-      geofast: "C:/Users/fuhtho/Daten/GEOFAST_Kartenfelder_EPSG3857/cog/mosaic_cog.tif"
+    pmt:
+      path: tests/fixtures/pmtiles/stamen_toner__raster_CC-BY+ODbL_z3.pmtiles
+      cache:
+        minzoom: 0
+        maxzoom: 3

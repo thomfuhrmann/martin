@@ -1,16 +1,13 @@
 //! Source for Zarr data
 use core::fmt;
-use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::time::Duration;
 use std::vec;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use martin_tile_utils::{Format, TileCoord, TileData, TileInfo};
-use moka::future::Cache;
 use object_store::ObjectStore;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::LazyLock;
@@ -20,6 +17,7 @@ use zarrs::array::Array;
 use zarrs_object_store::AsyncObjectStore;
 
 use crate::CacheZoomRange;
+use crate::tiles::zarr::cache::{WarpCache, WarpCacheKey};
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::utils::{
     TILE_PIXELS, WarpGrid, calculate_warp_grid, data_variables, get_bbox, get_fill_value,
@@ -35,61 +33,6 @@ const MAX_ZOOM: u8 = 23;
 /// Coordinate reference system of Martin tile server
 pub(crate) const TARGET_CRS: &str = "EPSG:3857";
 
-// TODO: add src crs to key
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct WarpCacheKey(TileCoord);
-
-impl Borrow<TileCoord> for WarpCacheKey {
-    fn borrow(&self) -> &TileCoord {
-        &self.0
-    }
-}
-
-/// Warp cache that stores transformation from tile pixel grid to source pixel grid
-#[derive(Debug, Clone)]
-pub struct WarpCache {
-    cache: Cache<WarpCacheKey, Option<WarpGrid>>,
-}
-
-impl WarpCache {
-    /// Creates a new warp cache
-    #[must_use]
-    pub fn new(
-        max_size_bytes: u64,
-        expiry: Option<Duration>,
-        idle_timeout: Option<Duration>,
-    ) -> Self {
-        #[allow(clippy::cast_possible_truncation)]
-        let mut builder = Cache::builder()
-            .name("zarr_warp_cache")
-            .weigher(|_key: &WarpCacheKey, value: &Option<WarpGrid>| {
-                value
-                    .as_ref()
-                    .map(|(grid, _)| {
-                        grid.len()
-                            .saturating_mul(size_of::<u32>())
-                            .try_into()
-                            .unwrap_or(u32::MAX)
-                            + 4 * size_of::<u64>() as u32
-                    })
-                    .unwrap_or_default()
-            })
-            .max_capacity(max_size_bytes);
-
-        if let Some(ttl) = expiry {
-            builder = builder.time_to_live(ttl);
-        }
-
-        if let Some(tti) = idle_timeout {
-            builder = builder.time_to_idle(tti);
-        }
-
-        Self {
-            cache: builder.build(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) enum SpatialRegistration {
     Pixel,
@@ -98,7 +41,7 @@ pub(crate) enum SpatialRegistration {
 
 /// Tile source that reads from `Zarr` stores
 #[derive(Clone)]
-pub struct ZarrSource<T: ObjectStore> {
+pub struct ZarrSource<T: ObjectStore + Clone> {
     id: String,
     tilejson: TileJSON,
     tileinfo: TileInfo,
@@ -115,7 +58,7 @@ pub struct ZarrSource<T: ObjectStore> {
     warp_cache: WarpCache,
 }
 
-impl<T: ObjectStore> Debug for ZarrSource<T> {
+impl<T: ObjectStore + Clone> Debug for ZarrSource<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ZarrTileSource")
             .field("id", &self.id)
@@ -123,11 +66,12 @@ impl<T: ObjectStore> Debug for ZarrSource<T> {
     }
 }
 
-impl<T: ObjectStore> ZarrSource<T> {
+impl<T: ObjectStore + Clone> ZarrSource<T> {
     /// Creates a new Zarr tile source from a file path
-    pub async fn async_new(
-        object_store: T,
+    pub async fn new(
         id: String,
+        object_store: T,
+        warp_cache: WarpCache,
         cache_zoom: CacheZoomRange,
     ) -> Result<Self, ZarrError> {
         let tileinfo = TileInfo::new(
@@ -174,8 +118,6 @@ impl<T: ObjectStore> ZarrSource<T> {
             maxzoom: MAX_ZOOM,
             bounds: bounds
         };
-
-        let warp_cache = WarpCache::new(0, None, None);
 
         Ok(Self {
             id,
@@ -330,7 +272,7 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
             let warp_grid = self
                 .warp_cache
                 .cache
-                .get_with(WarpCacheKey(xyz), async {
+                .get_with(WarpCacheKey(xyz, self.id.clone()), async {
                     self.run_calculate_warp_grid(xyz).await.ok()?
                 })
                 .await;

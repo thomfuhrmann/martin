@@ -114,6 +114,7 @@ default = [
   "webui",
   "geojson",
   "mlt",
+  "zarr",
 ]
 unstable-cog = ["martin-core/unstable-cog", "_tiles"]
 overlay = ["martin-core/overlay", "dep:geojson", "dep:csscolorparser"]
@@ -179,6 +180,7 @@ hotpath_tui = ["hotpath", "hotpath/tui"]
 test-pg = ["postgres"]
 test-duckdb = ["unstable-duckdb"]
 test-minio = ["pmtiles"]
+zarr = ["martin-core/zarr", "_tiles"]
 
 [dependencies]
 actix-cors.workspace = true
