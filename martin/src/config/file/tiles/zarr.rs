@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::str::FromStr as _;

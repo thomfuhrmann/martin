@@ -29,8 +29,6 @@ use crate::config::file::geojson::GeoJsonConfig;
 use crate::config::file::mbtiles::MbtConfig;
 #[cfg(feature = "passthrough")]
 use crate::config::file::passthrough::PassthroughConfig;
-#[cfg(feature = "pmtiles")]
-use crate::config::file::pmtiles::PmtConfig;
 #[cfg(feature = "postgres")]
 use crate::config::file::postgres::PostgresConfig;
 #[cfg(all(feature = "mlt", feature = "_tiles"))]
@@ -41,6 +39,8 @@ use crate::config::file::srv::SrvConfig;
 #[cfg(feature = "styles")]
 use crate::config::file::styles::StyleConfig;
 use crate::config::file::{CollectUnrecognizedKeys, GlobalCacheConfig, UnrecognizedValues};
+#[cfg(feature = "pmtiles")]
+use crate::config::file::{pmtiles::PmtConfig, zarr::ZarrConfig};
 #[cfg(feature = "postgres")]
 use crate::config::primitives::OptOneMany;
 #[cfg(feature = "_tiles")]
@@ -124,6 +124,11 @@ pub struct Config {
     #[cfg(feature = "pmtiles")]
     #[serde(default, skip_serializing_if = "FileConfigEnum::is_none")]
     pub pmtiles: FileConfigEnum<PmtConfig>,
+
+    /// Publish `Zarr` store from local disk or object store
+    #[cfg(feature = "zarr")]
+    #[serde(default, skip_serializing_if = "FileConfigEnum::is_none")]
+    pub zarr: FileConfigEnum<ZarrConfig>,
 
     /// Publish `MBTiles` files
     #[cfg(feature = "mbtiles")]

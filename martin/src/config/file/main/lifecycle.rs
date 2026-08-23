@@ -15,6 +15,9 @@ use futures::future::{BoxFuture, try_join_all};
 use martin_core::tiles::BoxedSource;
 #[cfg(feature = "pmtiles")]
 use martin_core::tiles::pmtiles::PmtCache;
+#[cfg(feature = "_tiles")]
+#[cfg(feature = "zarr")]
+use martin_core::tiles::zarr::cache::WarpCache;
 use tracing::{info, instrument, warn};
 
 use super::{Config, ServerState, init_aws_lc_tls, parse_base_path};
@@ -90,6 +93,13 @@ impl Config {
             self.pmtiles.finalize().await?;
         }
 
+        #[cfg(feature = "zarr")]
+        {
+            // Zarr initialisation in resolve_tile_sources depends on this and will panic otherwise
+            self.zarr = self.zarr.clone().into_config();
+            self.zarr.finalize().await?;
+        }
+
         #[cfg(feature = "mbtiles")]
         self.mbtiles.finalize().await?;
 
@@ -140,6 +150,9 @@ impl Config {
         #[cfg(feature = "unstable-cog")]
         let is_empty = is_empty && self.cog.is_empty();
 
+        #[cfg(feature = "zarr")]
+        let is_empty = is_empty && self.zarr.is_empty();
+
         #[cfg(feature = "unstable-duckdb")]
         let is_empty = is_empty && self.duckdb.is_empty();
 
@@ -182,12 +195,17 @@ impl Config {
         #[cfg(feature = "pmtiles")]
         let pmtiles_cache = cache_config.create_pmtiles_cache();
 
+        #[cfg(feature = "zarr")]
+        let warp_cache = cache_config.create_warp_cache();
+
         #[cfg(feature = "_tiles")]
         let (tile_sources, warnings) = self
             .resolve_tile_sources(
                 idr,
                 #[cfg(feature = "pmtiles")]
                 pmtiles_cache,
+                #[cfg(feature = "zarr")]
+                warp_cache,
             )
             .await?;
 
@@ -273,6 +291,23 @@ impl Config {
                 Self::make_sub_cache(size, expiry, idle)
             };
 
+            #[cfg(feature = "zarr")]
+            let zarr = {
+                let (size, expiry, idle) = if let FileConfigEnum::Config(cfg) = &self.zarr {
+                    (
+                        cfg.custom
+                            .warp_cache_config
+                            .size_mb
+                            .unwrap_or(cache_size_mb / 4),
+                        cfg.custom.warp_cache_config.expiry.or(global_expiry),
+                        cfg.custom.warp_cache_config.idle_timeout.or(global_idle),
+                    )
+                } else {
+                    (cache_size_mb / 4, global_expiry, global_idle)
+                };
+                Self::make_sub_cache(size, expiry, idle)
+            };
+
             #[cfg(feature = "sprites")]
             let sprites = {
                 let (size, expiry, idle) = if let FileConfigEnum::Config(cfg) = &self.sprites {
@@ -306,6 +341,8 @@ impl Config {
                 tiles,
                 #[cfg(feature = "pmtiles")]
                 pmtiles,
+                #[cfg(feature = "zarr")]
+                zarr,
                 #[cfg(feature = "sprites")]
                 sprites,
                 #[cfg(feature = "fonts")]
@@ -322,6 +359,8 @@ impl Config {
                 ),
                 #[cfg(feature = "pmtiles")]
                 pmtiles: Self::make_sub_cache(128, global_expiry, global_idle),
+                #[cfg(feature = "zarr")]
+                zarr: Self::make_sub_cache(128, global_expiry, global_idle),
                 #[cfg(feature = "sprites")]
                 sprites: Self::make_sub_cache(64, global_expiry, global_idle),
                 #[cfg(feature = "fonts")]
@@ -362,6 +401,7 @@ impl Config {
         &mut self,
         idr: &IdResolver,
         #[cfg(feature = "pmtiles")] pmtiles_cache: PmtCache,
+        #[cfg(feature = "zarr")] warp_cache: WarpCache,
     ) -> MartinResult<(Vec<Vec<BoxedSource>>, Vec<TileSourceWarning>)> {
         #[cfg_attr(
             not(any(
@@ -371,7 +411,8 @@ impl Config {
                 feature = "passthrough",
                 feature = "unstable-cog",
                 feature = "unstable-duckdb",
-                feature = "geojson"
+                feature = "geojson",
+                feature = "zarr"
             )),
             expect(unused_mut, reason = "tile backends push resolved sources here")
         )]
@@ -395,6 +436,22 @@ impl Config {
                 }
             }
             let val = resolve_files(cfg, idr, &["pmtiles"], self.cache.policy());
+            sources_and_warnings.push(Box::pin(val));
+        }
+
+        #[cfg(feature = "zarr")]
+        if !self.zarr.is_empty() {
+            let cfg = &mut self.zarr;
+            match cfg {
+                FileConfigEnum::None => {}
+                FileConfigEnum::Paths(_) | FileConfigEnum::Path(_) => unreachable!(
+                    "Zarr config was transformed to FileConfigEnum::Config in the previous step via `into_config`",
+                ),
+                FileConfigEnum::Config(file_config) => {
+                    file_config.custom.warp_cache = warp_cache;
+                }
+            }
+            let val = resolve_files(cfg, idr, &[""], self.cache.policy());
             sources_and_warnings.push(Box::pin(val));
         }
 

@@ -79,12 +79,11 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
             martin_tile_utils::Encoding::Uncompressed,
         );
 
-        // let local_store = LocalFileSystem::new_with_prefix(path.clone())
-        //     .map_err(|e| ZarrError::OjbectStoreError(e, path))?;
         let zarr_store = Arc::new(AsyncObjectStore::new(object_store));
 
         let time_coords = time_coords(Arc::clone(&zarr_store)).await?.map(Arc::new);
 
+        // resolve paths to data variables
         let mut data_vars = HashMap::new();
         let node_paths = data_variables(Arc::clone(&zarr_store)).await?;
         for node_path in node_paths {

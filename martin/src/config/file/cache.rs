@@ -8,7 +8,7 @@ use martin_core::sprites::{OptSpriteCache, SpriteCache};
 #[cfg(feature = "_tiles")]
 use martin_core::tiles::TileCache;
 #[cfg(feature = "pmtiles")]
-use martin_core::tiles::pmtiles::PmtCache;
+use martin_core::tiles::{pmtiles::PmtCache, zarr::cache::WarpCache};
 
 /// Per-cache-type settings bundling size, TTL, and idle timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +28,8 @@ pub struct CacheConfig {
     pub tiles: Option<SubCacheSetting>,
     #[cfg(feature = "pmtiles")]
     pub pmtiles: Option<SubCacheSetting>,
+    #[cfg(feature = "zarr")]
+    pub zarr: Option<SubCacheSetting>,
     #[cfg(feature = "sprites")]
     pub sprites: Option<SubCacheSetting>,
     #[cfg(feature = "fonts")]
@@ -67,6 +69,24 @@ impl CacheConfig {
             // TODO: make this actually disabled, not just zero sized cached
             tracing::debug!("PMTiles directory caching is disabled");
             PmtCache::new(0, None, None)
+        }
+    }
+
+    /// Creates a `Zarr` warp cache if configured.
+    #[cfg(feature = "pmtiles")]
+    #[must_use]
+    pub fn create_warp_cache(&self) -> WarpCache {
+        if let Some(setting) = &self.zarr {
+            tracing::info!(
+                "Initializing warp cache with maximum size {} MB",
+                setting.size_mb
+            );
+            let size = setting.size_mb.get() * 1000 * 1000;
+            WarpCache::new(size, setting.expiry, setting.idle_timeout)
+        } else {
+            // TODO: make this actually disabled, not just zero sized cached
+            tracing::debug!("Warp caching is disabled");
+            WarpCache::new(0, None, None)
         }
     }
 
