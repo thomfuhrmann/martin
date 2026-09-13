@@ -41,5 +41,4 @@ observability:
 
 zarr:
   sources:
-    snowgrid:
-      path: tests/fixtures/zarr/latest
+    snowgrid: tests/fixtures/zarr/latest

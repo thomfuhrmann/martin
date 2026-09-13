@@ -1,10 +1,11 @@
 use chrono::{DateTime, NaiveDate, TimeZone as _, Utc};
 use core::f64;
-use image::ImageFormat;
+use image::{ImageFormat, Rgba, RgbaImage};
 use martin_tile_utils::TileCoord;
 use object_store::ObjectStore;
 use std::io::Cursor;
 use std::{error::Error, ops::Range, sync::Arc};
+use zarrs::array::FillValue;
 use zarrs::node::async_get_child_nodes;
 use zarrs::storage::{AsyncListableStorageTraits, AsyncReadableStorageTraits};
 use zarrs::{
@@ -170,7 +171,7 @@ pub(crate) async fn get_spatial_shape<T: ObjectStore>(
 }
 
 /// Get the fill value of the source array
-pub(crate) async fn get_fill_value<T: ObjectStore>(
+pub(crate) async fn _get_fill_value<T: ObjectStore>(
     store: Arc<AsyncObjectStore<T>>,
 ) -> Result<f32, ZarrError> {
     let root_group = Group::async_open(store, NodePath::root().as_str())
@@ -184,6 +185,16 @@ pub(crate) async fn get_fill_value<T: ObjectStore>(
 
     serde_json::from_value::<f32>(fill_value.clone())
         .map_err(|e| ZarrError::AttributeError(format!("Missing fill_value: {e}")))
+}
+
+/// Convert fill value to f32
+pub(crate) fn fill_value_f32(fill_value: &FillValue) -> Result<f32, ZarrError> {
+    let bytes: [u8; 4] = fill_value
+        .as_ne_bytes()
+        .try_into()
+        .map_err(|_| ZarrError::DecodeError("Invalid f32 fill value".into()))?;
+
+    Ok(f32::from_ne_bytes(bytes))
 }
 
 /// Get the spatial registration of the source array
@@ -264,34 +275,40 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
     let x_end = warp_grid_bbox[2]
         .checked_add(1)
         .ok_or_else(|| ZarrError::DimensionError("x range overflow".into()))?;
-    let y_end = warp_grid_bbox[1]
+    let y_end = warp_grid_bbox[3]
         .checked_add(1)
         .ok_or_else(|| ZarrError::DimensionError("y range overflow".into()))?;
     let x_range = warp_grid_bbox[0]..x_end;
-    let y_range = warp_grid_bbox[3]..y_end;
+    let y_range = warp_grid_bbox[1]..y_end;
 
     let ranges = build_ranges(dimension_names, time_range.as_ref(), y_range, x_range)?;
     let perm = order_dimensions(dimension_names);
 
     let tile_data = match ranges.len() {
-        3 => {
-            let data = data_var
-                .async_retrieve_array_subset::<ndarray::Array3<f32>>(&ranges.as_slice())
-                .await
-                .map_err(ZarrError::ArrayError)?;
+        3 => match data_var.data_type().name(ZarrVersion::V3).as_deref() {
+            Some("float32") => {
+                let data = data_var
+                    .async_retrieve_array_subset::<ndarray::Array3<f32>>(&ranges)
+                    .await
+                    .map_err(ZarrError::ArrayError)?;
 
-            data.permuted_axes([perm[0], perm[1], perm[2]])
-        }
+                data.permuted_axes([perm[0], perm[1], perm[2]])
+            }
+            _ => return Err(ZarrError::CastError("Unimplemented data type".into())),
+        },
 
-        2 => {
-            let data = data_var
-                .async_retrieve_array_subset::<ndarray::Array2<f32>>(&ranges.as_slice())
-                .await
-                .map_err(ZarrError::ArrayError)?;
+        2 => match data_var.data_type().name(ZarrVersion::V3).as_deref() {
+            Some("float32") => {
+                let data = data_var
+                    .async_retrieve_array_subset::<ndarray::Array2<f32>>(&ranges)
+                    .await
+                    .map_err(ZarrError::ArrayError)?;
 
-            data.permuted_axes([perm[0], perm[1]])
-                .insert_axis(ndarray::Axis(0))
-        }
+                data.permuted_axes([perm[0], perm[1]])
+                    .insert_axis(ndarray::Axis(0))
+            }
+            _ => return Err(ZarrError::CastError("Unimplemented data type".into())),
+        },
 
         _ => {
             return Err(ZarrError::DimensionError(
@@ -322,9 +339,70 @@ pub(crate) fn sample_data(
     // let compressed_bytes = encode_all(raw_bytes, 3).map_err(ZarrError::EncodeError)?;
     // Ok(compressed_bytes)
 
-    sampled_data_to_png(&sampled_data, TILE_PIXELS, TILE_PIXELS, min, max)
+    sampled_data_to_png(
+        &sampled_data,
+        TILE_PIXELS,
+        TILE_PIXELS,
+        min,
+        max,
+        fill_value,
+    )
 }
 
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation)]
+fn sampled_data_to_png(
+    sampled_data: &[f32],
+    width: u32,
+    height: u32,
+    min: f32,
+    max: f32,
+    fill_value: f32,
+) -> Result<Vec<u8>, ZarrError> {
+    if sampled_data.len() != (width * height) as usize {
+        return Err(ZarrError::DimensionError(format!(
+            "Buffer size {} does not match dimensions {}x{}",
+            sampled_data.len(),
+            width,
+            height
+        )));
+    }
+
+    let mut image = RgbaImage::new(width, height);
+
+    // Guard against division by zero if min == max or range is effectively 0
+    let range = if (max - min).abs() < f32::EPSILON {
+        1.0
+    } else {
+        max - min
+    };
+
+    for (i, &value) in sampled_data.iter().enumerate() {
+        let is_nodata = (value - fill_value).abs() < f32::EPSILON;
+
+        let pixel = if is_nodata {
+            [0, 0, 0, 0]
+        } else {
+            let normalized = ((value - min) / range).clamp(0.0, 1.0);
+            let v = (normalized * 255.0).round() as u8;
+
+            [v, v, v, 255]
+        };
+
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+
+        image.put_pixel(x, y, Rgba(pixel));
+    }
+
+    let mut bytes = Cursor::new(Vec::new());
+
+    image
+        .write_to(&mut bytes, ImageFormat::Png)
+        .map_err(ZarrError::ImageError)?;
+
+    Ok(bytes.into_inner())
+}
 fn sample_warp_grid(
     warp_grid: &[i64],
     warp_grid_bbox: [u64; 4],
@@ -339,25 +417,20 @@ fn sample_warp_grid(
 
     for i in 0..tile_len {
         for j in 0..tile_len {
-            let idx = 2 * (i as usize * tile_len as usize + j as usize);
+            let idx = 2 * (j as usize * tile_len as usize + i as usize);
+
             let right = warp_grid[idx];
             let down = warp_grid[idx + 1];
 
-            // map to relative indices
-            let rel_right = if right == -1 {
-                right
-            } else {
-                right - warp_grid_bbox[0].cast_signed()
-            };
+            if right == -1 || down == -1 {
+                continue;
+            }
 
-            let rel_down = if down == -1 {
-                down
-            } else {
-                down - warp_grid_bbox[3].cast_signed()
-            };
+            let rel_right = right - warp_grid_bbox[0].cast_signed();
+            let rel_down = down - warp_grid_bbox[1].cast_signed();
 
             // bounds check and sample
-            if rel_right != -1 && rel_down != -1 {
+            if rel_right >= 0 && rel_down >= 0 {
                 let rel_down = usize::try_from(rel_down)
                     .map_err(|e| ZarrError::CastError(format!("Could not cast to usize: {e:?}")))?;
                 let rel_right = usize::try_from(rel_right)
@@ -375,43 +448,6 @@ fn sample_warp_grid(
     }
 
     Ok((sampled_data, min, max))
-}
-
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::cast_possible_truncation)]
-fn sampled_data_to_png(
-    sampled_data: &[f32],
-    width: u32,
-    height: u32,
-    min: f32,
-    max: f32,
-) -> Result<Vec<u8>, ZarrError> {
-    let mut image = image::RgbaImage::new(width, height);
-
-    let range = max - min;
-
-    for (i, &value) in sampled_data.iter().enumerate() {
-        let pixel = if value.is_nan() {
-            [0, 0, 0, 0] // transparent
-        } else {
-            let v = (((value - min) / range) * 255.0).clamp(0.0, 255.0) as u8;
-
-            [v, v, v, 255]
-        };
-
-        let x = (i as u32) % width;
-        let y = (i as u32) / width;
-
-        image.put_pixel(x, y, image::Rgba(pixel));
-    }
-
-    let mut bytes = Cursor::new(Vec::new());
-
-    image
-        .write_to(&mut bytes, ImageFormat::Png)
-        .map_err(ZarrError::ImageError)?;
-
-    Ok(bytes.into_inner())
 }
 
 pub(crate) type WarpGrid = (Box<[i64]>, [u64; 4]);
@@ -476,7 +512,7 @@ fn calculate_warp_grid_for_bbox(
     for i in 0..tile_len {
         for j in 0..tile_len {
             let x_target = x_min_target + (f64::from(i) + 0.5) * x_scale_target;
-            let y_target = y_min_target + (f64::from(j) + 0.5) * y_scale_target;
+            let y_target = y_max_target - (f64::from(j) + 0.5) * y_scale_target;
 
             let (x_src, y_src) = inv_trafo
                 .convert((x_target, y_target))
@@ -526,7 +562,7 @@ fn calculate_warp_grid_for_bbox(
                 tile_grid_bottom = tile_grid_bottom.max(down);
             }
 
-            let idx = 2 * (i as usize * tile_len as usize + j as usize);
+            let idx = 2 * (j as usize * tile_len as usize + i as usize);
 
             src_indices[idx] = right;
             src_indices[idx + 1] = down;
@@ -541,10 +577,10 @@ fn calculate_warp_grid_for_bbox(
     Ok(Some((
         src_indices,
         [
-            tile_grid_left.cast_unsigned(),
-            tile_grid_bottom.cast_unsigned(),
-            tile_grid_right.cast_unsigned(),
-            tile_grid_top.cast_unsigned(),
+            tile_grid_left.cast_unsigned(),   // col_min
+            tile_grid_top.cast_unsigned(),    // row_min (top)
+            tile_grid_right.cast_unsigned(),  // col_max
+            tile_grid_bottom.cast_unsigned(), // row_max (bottom)
         ],
     )))
 }
@@ -896,26 +932,33 @@ mod tests {
         let (sampled_data, min, max) = sample_warp_grid(&warp_grid, warp_grid_bbox, &data, 4, 0.0)
             .expect("could not calculate warp grid");
 
-        assert_eq!(sampled_data[6], 12.0);
+        assert_eq!(sampled_data[6], 22.0);
         assert_eq!(min, 0.0);
         assert_eq!(max, 22.0);
     }
 
     // 10/558/356
     // 9/275/177
+    // 10/542/360
     #[tokio::test]
     async fn test_sample_tile() {
+        fn save_png_bytes(file_path: &str, bytes: &[u8]) -> std::io::Result<()> {
+            std::fs::write(file_path, bytes)?;
+            Ok(())
+        }
+
         let store = get_zarr_store();
-        let data_var = Array::async_open(Arc::clone(&store), "/snow_depth")
+        let data_var = Array::async_open(Arc::clone(&store), "/liquid_water")
             .await
             .unwrap();
 
-        let tile = TileCoord::new_checked(10, 558, 356).unwrap();
+        let tile = TileCoord::new_checked(6, 34, 22).unwrap();
 
         // time
-        let time_str = "2026-08-13T00:00:00.000Z";
-        let datetime = DateTime::parse_from_rfc3339(time_str).unwrap();
-        let datetime_utc: DateTime<Utc> = datetime.with_timezone(&Utc);
+        let time_str = "2026-08-13T00:04:00.000Z";
+        let datetime = DateTime::parse_from_rfc3339(time_str)
+            .expect("msg")
+            .with_timezone(&Utc);
 
         let time_coords = time_coords(Arc::clone(&store)).await.unwrap().map(Arc::new);
         let src_transform = get_spatial_transform(Arc::clone(&store)).await.unwrap();
@@ -931,16 +974,14 @@ mod tests {
         )
         .expect("could not calculate warp grid")
         .expect("should be some");
-        let res = sample_data_var(
-            warp_grid,
-            warp_grid_bbox,
-            time_coords,
-            datetime_utc,
-            &data_var,
-            TILE_PIXELS,
-            0.0,
-        )
-        .await;
-        assert!(res.is_ok());
+        let tile_data =
+            retrieve_tile_data(warp_grid_bbox, time_coords.clone(), datetime, &data_var)
+                .await
+                .expect("could not retrieve tile data");
+        let res =
+            sample_data(&warp_grid, warp_grid_bbox, &tile_data, TILE_PIXELS, 0.0).expect("msg");
+
+        save_png_bytes("output.png", &res);
+        // assert!(res.is_ok());
     }
 }

@@ -50,6 +50,9 @@ pub enum ZarrError {
     /// Encode error
     #[error("Encode error: {0}")]
     EncodeError(std::io::Error),
+    /// Decode error
+    #[error("Decode error: {0}")]
+    DecodeError(String),
     /// Cast error
     #[error("Cast error: {0}")]
     CastError(String),

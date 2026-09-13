@@ -20,7 +20,7 @@ use crate::CacheZoomRange;
 use crate::tiles::zarr::cache::{WarpCache, WarpCacheKey};
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::utils::{
-    TILE_PIXELS, WarpGrid, calculate_warp_grid, data_variables, get_bbox, get_fill_value,
+    TILE_PIXELS, WarpGrid, calculate_warp_grid, data_variables, fill_value_f32, get_bbox,
     get_proj_code, get_spatial_registration, get_spatial_shape, get_spatial_transform,
     retrieve_tile_data, sample_data, time_coords,
 };
@@ -52,7 +52,6 @@ pub struct ZarrSource<T: ObjectStore + Clone> {
     src_crs: String,
     src_transform: [f64; 6],
     src_shape: [u64; 2],
-    fill_value: f32,
     spatial_registration: SpatialRegistration,
     cache_zoom: CacheZoomRange,
     warp_cache: WarpCache,
@@ -97,7 +96,6 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         let src_transform = get_spatial_transform(Arc::clone(&zarr_store)).await?;
         let src_bbox = get_bbox(Arc::clone(&zarr_store)).await?;
         let src_shape = get_spatial_shape(Arc::clone(&zarr_store)).await?;
-        let fill_value = get_fill_value(Arc::clone(&zarr_store)).await?;
         let spatial_registration = get_spatial_registration(Arc::clone(&zarr_store)).await?;
 
         // bounding box in tilejson needs to be in WGS84 - see <https://github.com/mapbox/tilejson-spec/tree/master/3.0.0#35-bounds>
@@ -129,7 +127,6 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
             src_crs,
             src_transform,
             src_shape,
-            fill_value,
             spatial_registration,
             cache_zoom,
             warp_cache,
@@ -161,8 +158,8 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         warp_grid: Box<[i64]>,
         warp_grid_bbox: [u64; 4],
         tile_data: ndarray::Array3<f32>,
+        fill_value: f32,
     ) -> Result<Vec<u8>, ZarrError> {
-        let fill_value = self.fill_value;
         run_on_rayon(move || {
             sample_data(
                 &warp_grid,
@@ -260,7 +257,7 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
         // }
 
         let time_str = "2026-08-13T00:00:00.000Z";
-        let data_var = "/snow_depth";
+        let data_var = "/snow_temp";
 
         if xyz.z >= self.min_zoom && xyz.z <= self.max_zoom {
             let data_var = self.data_vars.get(data_var).expect("msg");
@@ -284,8 +281,10 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                 retrieve_tile_data(warp_grid_bbox, self.time_coords.clone(), datetime, data_var)
                     .await?;
 
+            let fill_value = fill_value_f32(data_var.fill_value())?;
+
             let sampled_data = self
-                .run_sample_data(warp_grid, warp_grid_bbox, tile_data)
+                .run_sample_data(warp_grid, warp_grid_bbox, tile_data, fill_value)
                 .await
                 .map_err(MartinCoreError::ZarrError)?;
 

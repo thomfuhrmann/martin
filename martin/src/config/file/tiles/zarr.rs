@@ -11,6 +11,7 @@ use martin_core::tiles::BoxedSource;
 use martin_core::tiles::zarr::cache::WarpCache;
 use martin_core::tiles::zarr::source::ZarrSource;
 use object_store::aws::{AmazonS3Builder, AwsCredential, AwsCredentialProvider};
+use object_store::prefix::PrefixStore;
 use object_store::{CredentialProvider, ObjectStore, ObjectStoreScheme};
 use serde::{Deserialize, Serialize};
 use tracing::{trace, warn};
@@ -325,11 +326,13 @@ impl TileSourceConfiguration for ZarrConfig {
         url: Url,
         cache: CachePolicy,
     ) -> MartinResult<BoxedSource> {
-        let (store, _) = self
+        let (store, path) = self
             .parse_url_opts(&url)
             .map_err(|e| ConfigFileError::ObjectStoreUrlParsing(e, id.clone()))?;
         let warp_cache = self.warp_cache.clone();
-        let store: Arc<dyn ObjectStore> = store.into();
+
+        let store = PrefixStore::new(store, path);
+        let store: Arc<dyn ObjectStore> = Arc::new(store);
         let source = ZarrSource::new(id, store, warp_cache, cache.zoom()).await?;
         Ok(Box::new(source))
     }
