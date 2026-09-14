@@ -13,6 +13,7 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::LazyLock;
 use tilejson::{Bounds, TileJSON, tilejson};
 use tokio::sync::oneshot;
+use tracing::info;
 use zarrs::array::Array;
 use zarrs_object_store::AsyncObjectStore;
 
@@ -25,6 +26,8 @@ use crate::tiles::zarr::utils::{
     retrieve_tile_data, sample_data, time_coords,
 };
 use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
+
+// TODO: implement multiscales Zarr convention: https://github.com/zarr-conventions/multiscales
 
 /// Currently no pyramids - therefore full zoom range
 const MIN_ZOOM: u8 = 0;
@@ -73,10 +76,7 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         warp_cache: WarpCache,
         cache_zoom: CacheZoomRange,
     ) -> Result<Self, ZarrError> {
-        let tileinfo = TileInfo::new(
-            Format::OctetStream,
-            martin_tile_utils::Encoding::Uncompressed,
-        );
+        let tileinfo = TileInfo::new(Format::Png, martin_tile_utils::Encoding::Internal);
 
         let zarr_store = Arc::new(AsyncObjectStore::new(object_store));
 
@@ -159,6 +159,8 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         warp_grid_bbox: [u64; 4],
         tile_data: ndarray::Array3<f32>,
         fill_value: f32,
+        min: f32,
+        max: f32,
     ) -> Result<Vec<u8>, ZarrError> {
         run_on_rayon(move || {
             sample_data(
@@ -167,6 +169,8 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
                 &tile_data,
                 TILE_PIXELS,
                 fill_value,
+                min,
+                max,
             )
         })
         .await?
@@ -200,11 +204,13 @@ where
         .map_err(|_err_| ZarrError::WarpError("Rayon worker dropped".into()))
 }
 
-// #[derive(Debug, Default)]
-// struct QueryParams<'a> {
-//     date_time: Option<DateTime<Utc>>,
-//     data_var: Option<&'a str>,
-// }
+#[derive(Debug, Default)]
+struct QueryParams {
+    date_time: Option<DateTime<Utc>>,
+    data_var: Option<String>,
+    min: Option<f32>,
+    max: Option<f32>,
+}
 
 #[async_trait]
 impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
@@ -237,33 +243,57 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
     async fn get_tile(
         &self,
         xyz: TileCoord,
-        _url_query: Option<&UrlQuery>,
+        url_query: Option<&UrlQuery>,
     ) -> MartinCoreResult<TileData> {
-        // let mut query_params = QueryParams::default();
-        // if let Some(url_query) = url_query {
-        //     for (key, value) in url_query {
-        //         match key.as_str() {
-        //             "time" => {
-        //                 let date_time = DateTime::parse_from_rfc3339(value)
-        //                     .map(|dt| dt.with_timezone(&Utc))
-        //                     .map_err(ZarrError::ParseError)
-        //                     .map_err(MartinCoreError::ZarrError)?;
-        //                 query_params.date_time = Some(date_time);
-        //             }
-        //             "data_var" => query_params.data_var = Some(value.as_str()),
-        //             _ => info!("Query string not supported"),
-        //         }
-        //     }
-        // }
+        let mut query_params = QueryParams::default();
 
-        let time_str = "2026-08-13T00:00:00.000Z";
-        let data_var = "/snow_temp";
+        if let Some(url_query) = url_query {
+            for (key, value) in url_query {
+                match key.as_str() {
+                    "date" => {
+                        let date_time = DateTime::parse_from_rfc3339(value)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .map_err(ZarrError::ParseError)
+                            .map_err(MartinCoreError::ZarrError)?;
+                        query_params.date_time = Some(date_time);
+                    }
+                    "data_var" => {
+                        let path_str = value.as_str();
+                        let formatted = if path_str.starts_with('/') {
+                            path_str.to_owned()
+                        } else {
+                            format!("/{path_str}")
+                        };
+                        query_params.data_var = Some(formatted);
+                    }
+                    "min" => {
+                        let val_f32 = value.parse().map_err(ZarrError::ParseFloatError)?;
+                        query_params.min = Some(val_f32);
+                    }
+                    "max" => {
+                        let val_f32 = value.parse().map_err(ZarrError::ParseFloatError)?;
+                        query_params.max = Some(val_f32);
+                    }
+                    _ => info!("Query string not supported"),
+                }
+            }
+        }
 
-        if xyz.z >= self.min_zoom && xyz.z <= self.max_zoom {
-            let data_var = self.data_vars.get(data_var).expect("msg");
-            let datetime = DateTime::parse_from_rfc3339(time_str)
-                .expect("msg")
-                .with_timezone(&Utc);
+        if xyz.z >= self.min_zoom
+            && xyz.z <= self.max_zoom
+            && let (Some(date_time), Some(data_var_key), Some(min), Some(max)) = (
+                query_params.date_time,
+                query_params.data_var.as_deref(),
+                query_params.min,
+                query_params.max,
+            )
+        {
+            let data_var = self.data_vars.get(data_var_key).ok_or_else(|| {
+                ZarrError::ParameterError(format!(
+                    "Data variable {data_var_key} does not exist in Zarr store"
+                ))
+            })?;
+            let fill_value = fill_value_f32(data_var.fill_value())?;
 
             let warp_grid = self
                 .warp_cache
@@ -277,14 +307,16 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                 return Ok(vec![]);
             };
 
-            let tile_data =
-                retrieve_tile_data(warp_grid_bbox, self.time_coords.clone(), datetime, data_var)
-                    .await?;
-
-            let fill_value = fill_value_f32(data_var.fill_value())?;
+            let tile_data = retrieve_tile_data(
+                warp_grid_bbox,
+                self.time_coords.clone(),
+                date_time,
+                data_var,
+            )
+            .await?;
 
             let sampled_data = self
-                .run_sample_data(warp_grid, warp_grid_bbox, tile_data, fill_value)
+                .run_sample_data(warp_grid, warp_grid_bbox, tile_data, fill_value, min, max)
                 .await
                 .map_err(MartinCoreError::ZarrError)?;
 

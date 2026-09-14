@@ -1,6 +1,6 @@
 use chrono::{DateTime, NaiveDate, TimeZone as _, Utc};
 use core::f64;
-use image::{ImageFormat, Rgba, RgbaImage};
+use image::{GrayAlphaImage, ImageFormat, LumaA};
 use martin_tile_utils::TileCoord;
 use object_store::ObjectStore;
 use std::io::Cursor;
@@ -16,7 +16,6 @@ use zarrs::{
     plugin::ZarrVersion,
 };
 use zarrs_object_store::AsyncObjectStore;
-// use zstd::encode_all;
 
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::source::{SpatialRegistration, TARGET_CRS};
@@ -327,9 +326,11 @@ pub(crate) fn sample_data(
     tile_data: &ndarray::Array3<f32>,
     tile_len: u32,
     fill_value: f32,
+    min: f32,
+    max: f32,
 ) -> Result<Vec<u8>, ZarrError> {
     // sample from array at warp grid points
-    let (sampled_data, min, max) =
+    let (sampled_data, _min, _max) =
         sample_warp_grid(warp_grid, warp_grid_bbox, tile_data, tile_len, fill_value)?;
 
     // cast to raw bytes
@@ -368,9 +369,8 @@ fn sampled_data_to_png(
         )));
     }
 
-    let mut image = RgbaImage::new(width, height);
+    let mut image = GrayAlphaImage::new(width, height);
 
-    // Guard against division by zero if min == max or range is effectively 0
     let range = if (max - min).abs() < f32::EPSILON {
         1.0
     } else {
@@ -378,21 +378,22 @@ fn sampled_data_to_png(
     };
 
     for (i, &value) in sampled_data.iter().enumerate() {
-        let is_nodata = (value - fill_value).abs() < f32::EPSILON;
+        let is_nodata =
+            value.is_nan() || fill_value.is_nan() || (value - fill_value).abs() < f32::EPSILON;
 
         let pixel = if is_nodata {
-            [0, 0, 0, 0]
+            [0, 0] // Transparent (Luma=0, Alpha=0)
         } else {
             let normalized = ((value - min) / range).clamp(0.0, 1.0);
             let v = (normalized * 255.0).round() as u8;
 
-            [v, v, v, 255]
+            [v, 255] // Opaque Grayscale (Luma=v, Alpha=255)
         };
 
         let x = (i as u32) % width;
         let y = (i as u32) / width;
 
-        image.put_pixel(x, y, Rgba(pixel));
+        image.put_pixel(x, y, LumaA(pixel));
     }
 
     let mut bytes = Cursor::new(Vec::new());
@@ -403,6 +404,7 @@ fn sampled_data_to_png(
 
     Ok(bytes.into_inner())
 }
+
 fn sample_warp_grid(
     warp_grid: &[i64],
     warp_grid_bbox: [u64; 4],
@@ -937,16 +939,8 @@ mod tests {
         assert_eq!(max, 22.0);
     }
 
-    // 10/558/356
-    // 9/275/177
-    // 10/542/360
     #[tokio::test]
     async fn test_sample_tile() {
-        fn save_png_bytes(file_path: &str, bytes: &[u8]) -> std::io::Result<()> {
-            std::fs::write(file_path, bytes)?;
-            Ok(())
-        }
-
         let store = get_zarr_store();
         let data_var = Array::async_open(Arc::clone(&store), "/liquid_water")
             .await
@@ -978,10 +972,17 @@ mod tests {
             retrieve_tile_data(warp_grid_bbox, time_coords.clone(), datetime, &data_var)
                 .await
                 .expect("could not retrieve tile data");
-        let res =
-            sample_data(&warp_grid, warp_grid_bbox, &tile_data, TILE_PIXELS, 0.0).expect("msg");
+        let res = sample_data(
+            &warp_grid,
+            warp_grid_bbox,
+            &tile_data,
+            TILE_PIXELS,
+            0.0,
+            0.1,
+            90.7,
+        )
+        .expect("could not sample data");
 
-        save_png_bytes("output.png", &res);
-        // assert!(res.is_ok());
+        assert!(res.is_ok());
     }
 }

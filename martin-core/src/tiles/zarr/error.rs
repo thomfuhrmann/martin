@@ -1,6 +1,6 @@
 //! Error types for `Zarr` operations
 
-use std::path::PathBuf;
+use std::{num::ParseFloatError, path::PathBuf};
 
 use image::ImageError;
 
@@ -35,6 +35,9 @@ pub enum ZarrError {
     /// Chrono parse error
     #[error("Chrono parsing error: {0}")]
     ParseError(chrono::ParseError),
+    /// Float parse error
+    #[error("Float parsing error: {0}")]
+    ParseFloatError(ParseFloatError),
     /// Projection creation error
     #[error("Projection create error: {0}")]
     ProjCreateError(proj::ProjCreateError),
@@ -62,4 +65,7 @@ pub enum ZarrError {
     /// Image error
     #[error("Image error: {0}")]
     ImageError(ImageError),
+    /// Parameter error
+    #[error("Parameter error: {0}")]
+    ParameterError(String),
 }
