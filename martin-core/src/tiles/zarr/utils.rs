@@ -169,29 +169,12 @@ pub(crate) async fn get_spatial_shape<T: ObjectStore>(
         .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:shape format: {e}")))
 }
 
-/// Get the fill value of the source array
-pub(crate) async fn _get_fill_value<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<f32, ZarrError> {
-    let root_group = Group::async_open(store, NodePath::root().as_str())
-        .await
-        .map_err(ZarrError::GroupCreateError)?;
-
-    let fill_value = root_group
-        .attributes()
-        .get("fill_value")
-        .ok_or_else(|| ZarrError::AttributeError("fill_value is missing".into()))?;
-
-    serde_json::from_value::<f32>(fill_value.clone())
-        .map_err(|e| ZarrError::AttributeError(format!("Missing fill_value: {e}")))
-}
-
 /// Convert fill value to f32
 pub(crate) fn fill_value_f32(fill_value: &FillValue) -> Result<f32, ZarrError> {
     let bytes: [u8; 4] = fill_value
         .as_ne_bytes()
         .try_into()
-        .map_err(|_| ZarrError::DecodeError("Invalid f32 fill value".into()))?;
+        .map_err(ZarrError::FillValueError)?;
 
     Ok(f32::from_ne_bytes(bytes))
 }

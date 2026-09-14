@@ -1,6 +1,6 @@
 //! Error types for `Zarr` operations
 
-use std::{num::ParseFloatError, path::PathBuf};
+use std::{array::TryFromSliceError, num::ParseFloatError, path::PathBuf};
 
 use image::ImageError;
 
@@ -68,4 +68,7 @@ pub enum ZarrError {
     /// Parameter error
     #[error("Parameter error: {0}")]
     ParameterError(String),
+    /// Fill value conversion error
+    #[error("Fill value from slice error: {0}")]
+    FillValueError(TryFromSliceError),
 }
