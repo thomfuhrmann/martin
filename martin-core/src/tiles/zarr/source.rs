@@ -89,6 +89,7 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
             let array = Array::async_open(Arc::clone(&zarr_store), node_path.as_str())
                 .await
                 .map_err(ZarrError::ArrayCreateError)?;
+            let dimension_names = array.dimension_names();
             data_vars.insert(node_path.as_str().into(), array);
         }
 

@@ -1,0 +1,12 @@
+{
+  "attributes": {
+    "Conventions": "COARDS",
+    "coordinates": "spatial_ref",
+    "description": "Data is from NMC initialized reanalysis\n(4x/day).  These are the 0.9950 sigma level values.",
+    "platform": "Model",
+    "references": "http://www.esrl.noaa.gov/psd/data/gridded/data.ncep.reanalysis.html",
+    "title": "4x daily NMC reanalysis (1948)"
+  },
+  "node_type": "group",
+  "zarr_format": 3
+}

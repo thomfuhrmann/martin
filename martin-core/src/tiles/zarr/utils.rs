@@ -1,8 +1,11 @@
 use chrono::{DateTime, NaiveDate, TimeZone as _, Utc};
 use core::f64;
 use image::{GrayAlphaImage, ImageFormat, LumaA};
+use itertools::Itertools;
 use martin_tile_utils::TileCoord;
 use object_store::ObjectStore;
+use rustls::crypto::hash::Hash;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::{error::Error, ops::Range, sync::Arc};
 use zarrs::array::FillValue;
@@ -19,6 +22,32 @@ use zarrs_object_store::AsyncObjectStore;
 
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::source::{SpatialRegistration, TARGET_CRS};
+
+use serde::Deserialize;
+
+#[derive(Deserialize, Debug)]
+pub(crate) struct Multiscales {
+    layout: Vec<LayoutItem>,
+    resampling_method: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub(crate) struct LayoutItem {
+    asset: String,
+    #[serde(rename = "spatial:transform")]
+    spatial_transform: Option<[f64; 6]>,
+    #[serde(rename = "spatial:shape")]
+    spatial_shape: Option<[f64; 2]>,
+    derived_from: Option<String>,
+    transform: Option<Transform>,
+    resampling_method: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub(crate) struct Transform {
+    scale: Option<Vec<f64>>,
+    translation: Option<Vec<f64>>,
+}
 
 pub(crate) const TILE_PIXELS: u32 = 512;
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
@@ -118,6 +147,101 @@ pub(crate) async fn get_proj_code<T: ObjectStore>(
         .ok_or(ZarrError::AttributeError("proj:code".into()))
 }
 
+/// Get multiscales info if present
+pub(crate) async fn get_multiscales<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<Option<Multiscales>, ZarrError> {
+    let root_group = Group::async_open(store, NodePath::root().as_str())
+        .await
+        .map_err(ZarrError::GroupCreateError)?;
+
+    let Some(multiscales_value) = root_group.attributes().get("multiscales") else {
+        return Ok(None);
+    };
+
+    let multiscales = serde_json::from_value(multiscales_value.clone())
+        .map_err(|e| ZarrError::AttributeError(e.to_string()))?;
+
+    Ok(Some(multiscales))
+}
+
+fn insert_scales(
+    key: &str,
+    scale: &[f64],
+    multiscales: &Multiscales,
+    scales: &mut HashMap<String, [f64; 2]>,
+) {
+    let curr_levels = multiscales
+        .layout
+        .iter()
+        .filter(|&item| item.derived_from.as_deref() == Some(key));
+
+    for level in curr_levels {
+        if scales.get(&level.asset).is_none() {
+            let current_key = &level.asset;
+            let current_scale = level.transform.clone().and_then(|trans| trans.scale);
+            if let Some(current_scale) = current_scale {
+                // TODO: indexing
+                let new_scale = [scale[0] * current_scale[1], scale[1] * current_scale[2]];
+                scales.insert(current_key.into(), new_scale);
+                insert_scales(current_key, &new_scale[..], multiscales, scales);
+            }
+        }
+    }
+}
+
+pub(crate) fn get_scales(multiscales: Multiscales) -> HashMap<String, [f64; 2]> {
+    let mut scales = HashMap::with_capacity(multiscales.layout.len());
+
+    let root_key = multiscales
+        .layout
+        .iter()
+        .find(|item| item.derived_from.is_none())
+        .map_or(String::new(), |root| root.asset.clone());
+
+    scales.insert(root_key, [1.0, 1.0]);
+
+    for layout in multiscales.layout {
+        let transform = layout.transform;
+    }
+
+    scales
+}
+
+/// Get dimension names
+pub(crate) async fn get_dimension_names<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<Vec<String>, ZarrError> {
+    let root_group = Group::async_open(store, NodePath::root().as_str())
+        .await
+        .map_err(ZarrError::GroupCreateError)?;
+
+    let names = root_group
+        .attributes()
+        .get("dimension_names")
+        .ok_or_else(|| ZarrError::AttributeError("dimension_names is missing".into()))?;
+
+    serde_json::from_value::<Vec<_>>(names.clone())
+        .map_err(|e| ZarrError::AttributeError(format!("Invalid dimension_names: {e}")))
+}
+
+pub(crate) fn get_spatial_dims_indices(
+    spatial_dims: &[&str],
+    dimension_names: &[DimensionName],
+) -> Vec<usize> {
+    let mut result = Vec::new();
+    for &spatial_dim in spatial_dims {
+        if let Some(val) = dimension_names
+            .iter()
+            .position(|name| name.as_deref() == Some(spatial_dim))
+        {
+            result.push(val);
+        }
+    }
+
+    result
+}
+
 /// Get the affine transformation from pixel space to geographic space
 pub(crate) async fn get_spatial_transform<T: ObjectStore>(
     store: Arc<AsyncObjectStore<T>>,
@@ -203,7 +327,7 @@ pub(crate) async fn get_spatial_registration<T: ObjectStore>(
 }
 
 /// Returns the names of the spatial dimensions
-pub(crate) fn _get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
+pub(crate) fn get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
     array
         .attributes()
         .get("spatial:dimensions")
@@ -766,7 +890,7 @@ mod tests {
     static ZARR_STORE: LazyLock<Arc<AsyncObjectStore<LocalFileSystem>>> = LazyLock::new(|| {
         let path = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../tests/fixtures/zarr/latest"
+            "/../tests/fixtures/zarr/pyramid.zarr"
         ));
         let local_store =
             LocalFileSystem::new_with_prefix(path).expect("could not create file system storage");
@@ -793,6 +917,17 @@ mod tests {
         let bbox = get_bbox(store).await.expect("could not get bounding box");
 
         assert_eq!(bbox, [19500.0, 189500.0, 720500.0, 620500.0]);
+    }
+
+    #[tokio::test]
+    async fn test_get_multiscales() {
+        let store = get_zarr_store();
+        let multiscales = get_multiscales(store)
+            .await
+            .expect("could not get transform")
+            .expect("should have multiscales");
+
+        println!("{multiscales:?}");
     }
 
     #[test]
@@ -963,8 +1098,7 @@ mod tests {
             0.0,
             0.1,
             90.7,
-        )
-        .expect("could not sample data");
+        );
 
         assert!(res.is_ok());
     }

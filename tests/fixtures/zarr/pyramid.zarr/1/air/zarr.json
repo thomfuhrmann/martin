@@ -1,0 +1,70 @@
+{
+  "attributes": {
+    "actual_range": [185.16000366210938, 322.1000061035156],
+    "coordinates": "spatial_ref",
+    "dataset": "NMC Reanalysis",
+    "GRIB_id": 11,
+    "GRIB_name": "TMP",
+    "level_desc": "Surface",
+    "long_name": "4xDaily Air temperature at sigma level 995",
+    "parent_stat": "Other",
+    "precision": 2,
+    "statistic": "Individual Obs",
+    "units": "degK",
+    "var_desc": "Air temperature"
+  },
+  "chunk_grid": {
+    "configuration": {
+      "chunk_shape": [128, 12, 26]
+    },
+    "name": "regular"
+  },
+  "chunk_key_encoding": {
+    "configuration": {
+      "separator": "/"
+    },
+    "name": "default"
+  },
+  "codecs": [
+    {
+      "configuration": {
+        "chunk_shape": [1, 12, 26],
+        "codecs": [
+          {
+            "configuration": {
+              "endian": "little"
+            },
+            "name": "bytes"
+          },
+          {
+            "configuration": {
+              "checksum": false,
+              "level": 0
+            },
+            "name": "zstd"
+          }
+        ],
+        "index_codecs": [
+          {
+            "configuration": {
+              "endian": "little"
+            },
+            "name": "bytes"
+          },
+          {
+            "name": "crc32c"
+          }
+        ],
+        "index_location": "end"
+      },
+      "name": "sharding_indexed"
+    }
+  ],
+  "data_type": "float64",
+  "dimension_names": ["time", "lat", "lon"],
+  "fill_value": "NaN",
+  "node_type": "array",
+  "shape": [2920, 12, 26],
+  "storage_transformers": [],
+  "zarr_format": 3
+}
