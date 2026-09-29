@@ -15,15 +15,17 @@ use tilejson::{Bounds, TileJSON, tilejson};
 use tokio::sync::oneshot;
 use tracing::info;
 use zarrs::array::Array;
+use zarrs::node::Node;
 use zarrs_object_store::AsyncObjectStore;
 
 use crate::CacheZoomRange;
 use crate::tiles::zarr::cache::{WarpCache, WarpCacheKey};
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::utils::{
-    TILE_PIXELS, WarpGrid, calculate_warp_grid, data_variables, fill_value_f32, get_bbox,
-    get_proj_code, get_spatial_registration, get_spatial_shape, get_spatial_transform,
-    retrieve_tile_data, sample_data, time_coords,
+    LayoutItem, TILE_PIXELS, WarpGrid, abs_scales, calculate_warp_grid, data_variables,
+    fill_value_f32, get_bbox, get_multiscales, get_proj, get_spatial_dims,
+    get_spatial_dims_indices, get_spatial_registration, get_spatial_transform, retrieve_tile_data,
+    sample_data, spatial_resolutions, tile_res, time_coords,
 };
 use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
 
@@ -31,7 +33,7 @@ use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
 
 /// Currently no pyramids - therefore full zoom range
 const MIN_ZOOM: u8 = 0;
-const MAX_ZOOM: u8 = 23;
+const MAX_ZOOM: u8 = 30;
 
 /// Coordinate reference system of Martin tile server
 pub(crate) const TARGET_CRS: &str = "EPSG:3857";
@@ -58,6 +60,7 @@ pub struct ZarrSource<T: ObjectStore + Clone> {
     spatial_registration: SpatialRegistration,
     cache_zoom: CacheZoomRange,
     warp_cache: WarpCache,
+    layout_items: Option<HashMap<u64, LayoutItem>>,
 }
 
 impl<T: ObjectStore + Clone> Debug for ZarrSource<T> {
@@ -76,28 +79,30 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         warp_cache: WarpCache,
         cache_zoom: CacheZoomRange,
     ) -> Result<Self, ZarrError> {
+        // tiles will be served as PNG which uses its own encoding
         let tileinfo = TileInfo::new(Format::Png, martin_tile_utils::Encoding::Internal);
 
+        // wrap object store for zarrs
         let zarr_store = Arc::new(AsyncObjectStore::new(object_store));
 
+        // get time coordinates
         let time_coords = time_coords(Arc::clone(&zarr_store)).await?.map(Arc::new);
 
-        // resolve paths to data variables
-        let mut data_vars = HashMap::new();
-        let node_paths = data_variables(Arc::clone(&zarr_store)).await?;
-        for node_path in node_paths {
-            let array = Array::async_open(Arc::clone(&zarr_store), node_path.as_str())
-                .await
-                .map_err(ZarrError::ArrayCreateError)?;
-            let dimension_names = array.dimension_names();
-            data_vars.insert(node_path.as_str().into(), array);
-        }
-
-        let src_crs = get_proj_code(Arc::clone(&zarr_store)).await?;
-        let src_transform = get_spatial_transform(Arc::clone(&zarr_store)).await?;
-        let src_bbox = get_bbox(Arc::clone(&zarr_store)).await?;
-        let src_shape = get_spatial_shape(Arc::clone(&zarr_store)).await?;
-        let spatial_registration = get_spatial_registration(Arc::clone(&zarr_store)).await?;
+        // get spatial metadata
+        // TODO: currently it is supposed that the metadata includes the following GeoZarr conventions: proj, spatial
+        // multiscales is optional
+        let root_node = Node::async_open(Arc::clone(&zarr_store), "/")
+            .await
+            .map_err(|e| ZarrError::NodeCreateError(e))?;
+        let src_crs = get_proj(&root_node).unwrap_or("EPSG:4326".into());
+        let src_transform =
+            get_spatial_transform(&root_node)?.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let src_bbox = get_bbox(&root_node)?.unwrap_or([0.0, 0.0, 0.0, 0.0]);
+        let spatial_registration =
+            get_spatial_registration(&root_node)?.unwrap_or(SpatialRegistration::Pixel);
+        let spatial_dims =
+            get_spatial_dims(&root_node)?.unwrap_or(vec!["lat".into(), "lon".into()]);
+        let multiscales = get_multiscales(&root_node)?;
 
         // bounding box in tilejson needs to be in WGS84 - see <https://github.com/mapbox/tilejson-spec/tree/master/3.0.0#35-bounds>
         let transformer = proj::Proj::try_from((src_crs.as_str(), "EPSG:4326"))
@@ -117,6 +122,69 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
             bounds: bounds
         };
 
+        // resolve paths to data variables
+        let mut data_vars: HashMap<String, _> = HashMap::new();
+        let nodes = data_variables(Arc::clone(&zarr_store)).await?;
+        let mut src_shape = [0, 0];
+        let mut dimension_names = None;
+        let mut first = true;
+        for node in &nodes {
+            let array = Array::async_open(Arc::clone(&zarr_store), node.path().as_str())
+                .await
+                .map_err(ZarrError::ArrayCreateError)?;
+            if first {
+                // assuming that the dimension names are the same for all arrays of this store
+                dimension_names = array.dimension_names().clone();
+                first = false;
+            }
+            data_vars.insert(node.path().as_str().into(), array);
+        }
+
+        // get the base layout for multiscales
+        let base_layout = multiscales
+            .clone()
+            .and_then(|multi| {
+                multi
+                    .layout
+                    .iter()
+                    .find(|item| item.derived_from.is_none())
+                    .cloned()
+            })
+            .expect("should have base layout item");
+
+        // calculate absolute scales and corresponding layout items for multiscales
+        let mut layout_items = None;
+        if let Some(multiscales) = &multiscales {
+            if let Some(dimension_names) = dimension_names {
+                let shape = if let Some(shape) = &base_layout.spatial_shape {
+                    shape
+                } else {
+                    let base_path = base_layout.asset;
+                    let (_, arr) = data_vars
+                        .iter()
+                        .find(|(path, _)| path.starts_with(&base_path))
+                        .expect("should be at least one variable at base resolution level");
+                    arr.shape()
+                };
+
+                let indices = get_spatial_dims_indices(spatial_dims.as_slice(), &dimension_names)?;
+                let base_shape: Vec<u64> = indices.iter().map(|&idx| shape[idx]).collect();
+                src_shape = [base_shape[0], base_shape[1]];
+
+                let base_res = spatial_resolutions(&base_shape, &src_bbox);
+                let abs_scales = abs_scales(base_res, &multiscales, indices.as_slice());
+
+                let mut items = HashMap::new();
+                for (key, scale) in abs_scales {
+                    let item = multiscales.layout.iter().find(|item| item.asset == key);
+                    if let Some(item) = item {
+                        items.insert(scale, item.clone());
+                    }
+                }
+                layout_items = Some(items);
+            }
+        }
+
         Ok(Self {
             id,
             tilejson,
@@ -131,15 +199,36 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
             spatial_registration,
             cache_zoom,
             warp_cache,
+            layout_items,
         })
     }
 
     /// Calculate warp grid
     async fn run_calculate_warp_grid(&self, xyz: TileCoord) -> Result<Option<WarpGrid>, ZarrError> {
-        let src_transform = self.src_transform;
         let src_crs = self.src_crs.clone();
-        let src_shape = self.src_shape;
         let spatial_registration = self.spatial_registration.clone();
+
+        // find matching layout item if it is a multiscales geozarr
+        let matching_item = if let Some(layout_items) = &self.layout_items {
+            let target_res = tile_res(xyz.z);
+            let (_, layout_item) = layout_items
+                .iter()
+                .filter(|(scale_key, _)| **scale_key <= target_res)
+                .max_by_key(|(scale_key, _)| **scale_key)
+                .or_else(|| layout_items.iter().max_by_key(|(scale_key, _)| **scale_key))
+                .expect("at least one item should match");
+            Some(layout_item)
+        } else {
+            None
+        };
+
+        let src_transform = matching_item
+            .and_then(|item| item.spatial_transform)
+            .unwrap_or(self.src_transform);
+
+        let src_shape = matching_item
+            .and_then(|item| item.spatial_shape)
+            .unwrap_or(self.src_shape);
 
         run_on_rayon(move || {
             calculate_warp_grid(

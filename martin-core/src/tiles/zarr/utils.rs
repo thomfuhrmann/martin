@@ -1,20 +1,18 @@
 use chrono::{DateTime, NaiveDate, TimeZone as _, Utc};
 use core::f64;
 use image::{GrayAlphaImage, ImageFormat, LumaA};
-use itertools::Itertools;
 use martin_tile_utils::TileCoord;
 use object_store::ObjectStore;
-use rustls::crypto::hash::Hash;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::{error::Error, ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc};
 use zarrs::array::FillValue;
+use zarrs::group::GroupMetadata;
 use zarrs::node::async_get_child_nodes;
 use zarrs::storage::{AsyncListableStorageTraits, AsyncReadableStorageTraits};
 use zarrs::{
     array::{Array, ArrayMetadata, DimensionName},
-    filesystem::FilesystemStore,
-    group::Group,
     node::{Node, NodeMetadata, NodePath},
     plugin::ZarrVersion,
 };
@@ -25,22 +23,22 @@ use crate::tiles::zarr::source::{SpatialRegistration, TARGET_CRS};
 
 use serde::Deserialize;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub(crate) struct Multiscales {
-    layout: Vec<LayoutItem>,
-    resampling_method: Option<String>,
+    pub(crate) layout: Vec<LayoutItem>,
+    pub(crate) resampling_method: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub(crate) struct LayoutItem {
-    asset: String,
+    pub(crate) asset: String,
     #[serde(rename = "spatial:transform")]
-    spatial_transform: Option<[f64; 6]>,
+    pub(crate) spatial_transform: Option<[f64; 6]>,
     #[serde(rename = "spatial:shape")]
-    spatial_shape: Option<[f64; 2]>,
-    derived_from: Option<String>,
-    transform: Option<Transform>,
-    resampling_method: Option<String>,
+    pub(crate) spatial_shape: Option<[u64; 2]>,
+    pub(crate) derived_from: Option<String>,
+    pub(crate) transform: Option<Transform>,
+    pub(crate) resampling_method: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -52,52 +50,23 @@ pub(crate) struct Transform {
 pub(crate) const TILE_PIXELS: u32 = 512;
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
 
+/// Calculate tile length for zoom level
+pub(crate) fn tile_len(zoom: u8) -> f64 {
+    EARTH_CIRCUMFERENCE / f64::from(1_u32 << zoom)
+}
+
+/// Calculate spatial resolution per pixel
+pub(crate) fn tile_res(zoom: u8) -> u64 {
+    (tile_len(zoom).round() as u64) / (TILE_PIXELS as u64)
+}
+
 /// Calculates the spatial bounding box of a tile
 pub(crate) fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
-    let tile_length = EARTH_CIRCUMFERENCE / f64::from(1_u32 << zoom);
+    let tile_length = tile_len(zoom);
     let min_x = EARTH_CIRCUMFERENCE * -0.5 + f64::from(x) * tile_length;
     let max_y = EARTH_CIRCUMFERENCE * 0.5 - f64::from(y) * tile_length;
 
     [min_x, max_y - tile_length, min_x + tile_length, max_y]
-}
-
-/// Retrieve all data variables of this store - arrays that are not dimensions
-pub(crate) async fn data_variables<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<Vec<NodePath>, ZarrError> {
-    let root_path = NodePath::root();
-    let child_nodes = async_get_child_nodes(&store, &root_path, true)
-        .await
-        .map_err(ZarrError::NodeCreateError)?;
-    let filtered_child_nodes = child_nodes
-        .into_iter()
-        .filter(|n| is_data_variable(n).is_ok_and(|is_data| is_data))
-        .map(|n| n.path().clone())
-        .collect::<Vec<_>>();
-    Ok(filtered_child_nodes)
-}
-
-/// Retrieve time variable
-pub(crate) async fn time_coords<
-    S: AsyncReadableStorageTraits + AsyncListableStorageTraits + 'static,
->(
-    store: Arc<S>,
-) -> Result<Option<Array<S>>, ZarrError> {
-    let root_path = NodePath::root();
-    let child_nodes = async_get_child_nodes(&store, &root_path, true)
-        .await
-        .map_err(ZarrError::NodeCreateError)?;
-    let time_node_path = child_nodes
-        .into_iter()
-        .find(|n| n.name().as_str() == "time")
-        .map(|n| n.path().clone());
-    if let Some(node_path) = time_node_path {
-        let array = Array::async_open(store, node_path.as_str())
-            .await
-            .map_err(ZarrError::ArrayCreateError)?;
-        return Ok(Some(array));
-    }
-    Ok(None)
 }
 
 /// Check if the array is a data variable
@@ -127,49 +96,215 @@ fn is_data_variable(node: &Node) -> Result<bool, ZarrError> {
         NodeMetadata::Group(_) => Vec::new(),
     };
 
+    if dim_names.is_empty() {
+        return Ok(false);
+    }
+
     let is_coord = dim_names.iter().any(|dim_name| path.ends_with(dim_name));
     Ok(!is_coord)
 }
 
-/// Get coordinate system definition as EPSG code
-pub(crate) async fn get_proj_code<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<String, ZarrError> {
-    let root_group = Group::async_open(store, NodePath::root().as_str())
-        .await
-        .map_err(ZarrError::GroupCreateError)?;
+/// Helper function for node traversal
+fn visit_nodes_recursive(node: &Node, nodes: &mut Vec<Node>) {
+    if is_data_variable(node).is_ok_and(|val| val) {
+        nodes.push(node.clone())
+    };
 
-    root_group
-        .attributes()
+    for child in node.children() {
+        visit_nodes_recursive(child, nodes);
+    }
+}
+
+/// Retrieve all data variables of this store - arrays that are not coordinates
+pub(crate) async fn data_variables<T: ObjectStore>(
+    store: Arc<AsyncObjectStore<T>>,
+) -> Result<Vec<Node>, ZarrError> {
+    let root_path = NodePath::root();
+    let child_nodes = async_get_child_nodes(&store, &root_path, true)
+        .await
+        .map_err(ZarrError::NodeCreateError)?;
+    let mut nodes = Vec::new();
+    for node in child_nodes {
+        visit_nodes_recursive(&node, &mut nodes);
+    }
+    Ok(nodes)
+}
+
+/// Retrieve time array
+pub(crate) async fn time_coords<
+    S: AsyncReadableStorageTraits + AsyncListableStorageTraits + 'static,
+>(
+    store: Arc<S>,
+) -> Result<Option<Array<S>>, ZarrError> {
+    let root_path = NodePath::root();
+    let child_nodes = async_get_child_nodes(&store, &root_path, true)
+        .await
+        .map_err(ZarrError::NodeCreateError)?;
+    let time_node_path = child_nodes
+        .into_iter()
+        .find(|n| n.name().as_str() == "time")
+        .map(|n| n.path().clone());
+    if let Some(node_path) = time_node_path {
+        let array = Array::async_open(store, node_path.as_str())
+            .await
+            .map_err(ZarrError::ArrayCreateError)?;
+        return Ok(Some(array));
+    }
+    Ok(None)
+}
+
+pub(crate) fn node_attributes(node: &Node) -> Map<String, Value> {
+    match node.metadata() {
+        NodeMetadata::Array(ArrayMetadata::V2(metadata)) => metadata.attributes.clone(),
+        NodeMetadata::Array(ArrayMetadata::V3(metadata)) => metadata.attributes.clone(),
+        NodeMetadata::Group(GroupMetadata::V2(metadata)) => metadata.attributes.clone(),
+        NodeMetadata::Group(GroupMetadata::V3(metadata)) => metadata.attributes.clone(),
+    }
+}
+
+/// Get coordinate system definition as EPSG code
+///
+/// At least one of proj:code, proj:wkt2, or proj:projjson MUST be provided.
+/// Inherited to direct child arrays of a group. Can be overriden at array level.
+pub(crate) fn get_proj(node: &Node) -> Option<String> {
+    let attributes = node_attributes(node);
+    node_attributes(node)
         .get("proj:code")
-        .and_then(|val| val.as_str())
-        .map(Into::into)
-        .ok_or(ZarrError::AttributeError("proj:code".into()))
+        .or_else(|| attributes.get("proj:wkt2"))
+        .and_then(|val| val.as_str().map(|s| s.to_string()))
+        .or_else(|| {
+            attributes.get("proj:projjson").map(|val| match val {
+                Value::Object(_) => val.to_string(),
+                _ => val.to_string(),
+            })
+        })
+}
+
+/// Get spatial dimension names
+///
+/// Optional for groups and required for arrays
+pub(crate) fn get_spatial_dims(node: &Node) -> Result<Option<Vec<String>>, ZarrError> {
+    node_attributes(node)
+        .get("spatial:dimensions")
+        .map(|val| {
+            serde_json::from_value::<Vec<String>>(val.clone())
+                .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:dimensions: {e}")))
+        })
+        .transpose()
+}
+
+/// Get the indices of spatial dimensions
+///
+/// Each entry in spatial:dimensions MUST match one of the names declared in the array's dimension_names metadata field (a top-level field of the Zarr V3 array metadata, not an attribute). -> https://github.com/zarr-conventions/spatial#spatialdimensions
+pub(crate) fn get_spatial_dims_indices<T: AsRef<str>>(
+    spatial_dims: &[T],
+    dimension_names: &[DimensionName],
+) -> Result<Vec<usize>, ZarrError> {
+    let mut result = Vec::new();
+    for spatial_dim in spatial_dims {
+        let val = dimension_names
+            .iter()
+            .position(|name| name.as_deref() == Some(spatial_dim.as_ref()))
+            .ok_or_else(|| {
+                ZarrError::DimensionError(format!(
+                    "Missing spatial dimension: {}",
+                    spatial_dim.as_ref()
+                ))
+            })?;
+        result.push(val);
+    }
+
+    Ok(result)
+}
+
+/// Get the affine transformation from pixel space to geographic space
+///
+///  Required when spatial:transform_type is "affine"
+pub(crate) fn get_spatial_transform(node: &Node) -> Result<Option<[f64; 6]>, ZarrError> {
+    node_attributes(node)
+        .get("spatial:transform")
+        .map(|val| {
+            serde_json::from_value::<[f64; 6]>(val.clone()).map_err(|e| {
+                ZarrError::AttributeError(format!("Invalid spatial:transform format: {e}"))
+            })
+        })
+        .transpose()
+}
+
+/// Get the bounding box
+///
+/// Optional
+pub(crate) fn get_bbox(node: &Node) -> Result<Option<[f64; 4]>, ZarrError> {
+    node_attributes(node)
+        .get("spatial:bbox")
+        .map(|val| {
+            serde_json::from_value::<[f64; 4]>(val.clone()).map_err(|e| {
+                ZarrError::AttributeError(format!("Invalid spatial:transform format: {e}"))
+            })
+        })
+        .transpose()
+}
+
+/// Get the shape of the source array
+///
+/// Optional
+pub(crate) fn get_spatial_shape(node: &Node) -> Result<Option<[u64; 2]>, ZarrError> {
+    node_attributes(node)
+        .get("spatial:shape")
+        .map(|value| {
+            serde_json::from_value::<[u64; 2]>(value.clone()).map_err(|e| {
+                ZarrError::AttributeError(format!("Invalid spatial:shape format: {e}"))
+            })
+        })
+        .transpose()
+}
+
+/// Get the spatial registration of the source array
+///
+/// Optional
+pub(crate) fn get_spatial_registration(
+    node: &Node,
+) -> Result<Option<SpatialRegistration>, ZarrError> {
+    let attributes = node_attributes(node);
+    let registration = attributes
+        .get("spatial:registration")
+        .and_then(|val| val.as_str());
+    match registration {
+        Some("node") => Ok(Some(SpatialRegistration::Node)),
+        Some("pixel") => Ok(Some(SpatialRegistration::Pixel)),
+        _ => Ok(None),
+    }
 }
 
 /// Get multiscales info if present
-pub(crate) async fn get_multiscales<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<Option<Multiscales>, ZarrError> {
-    let root_group = Group::async_open(store, NodePath::root().as_str())
-        .await
-        .map_err(ZarrError::GroupCreateError)?;
-
-    let Some(multiscales_value) = root_group.attributes().get("multiscales") else {
-        return Ok(None);
-    };
-
-    let multiscales = serde_json::from_value(multiscales_value.clone())
-        .map_err(|e| ZarrError::AttributeError(e.to_string()))?;
-
-    Ok(Some(multiscales))
+///
+/// Optional
+pub(crate) fn get_multiscales(node: &Node) -> Result<Option<Multiscales>, ZarrError> {
+    node_attributes(node)
+        .get("multiscales")
+        .map(|val| {
+            serde_json::from_value(val.clone())
+                .map_err(|e| ZarrError::AttributeError(e.to_string()))
+        })
+        .transpose()
 }
 
+/// Calculate the resolutions in x and y
+pub(crate) fn spatial_resolutions(shape: &[u64], bbox: &[f64]) -> [f64; 2] {
+    let delta_x = bbox[2] - bbox[0];
+    let delta_y = bbox[3] - bbox[1];
+    let res_x = delta_x / (shape[1] as f64);
+    let res_y = delta_y / (shape[0] as f64);
+    [res_y, res_x]
+}
+
+/// Helper to create absolute scale values
 fn insert_scales(
     key: &str,
     scale: &[f64],
     multiscales: &Multiscales,
-    scales: &mut HashMap<String, [f64; 2]>,
+    scales: &mut HashMap<String, u64>,
+    indices: &[usize],
 ) {
     let curr_levels = multiscales
         .layout
@@ -181,116 +316,55 @@ fn insert_scales(
             let current_key = &level.asset;
             let current_scale = level.transform.clone().and_then(|trans| trans.scale);
             if let Some(current_scale) = current_scale {
-                // TODO: indexing
-                let new_scale = [scale[0] * current_scale[1], scale[1] * current_scale[2]];
-                scales.insert(current_key.into(), new_scale);
-                insert_scales(current_key, &new_scale[..], multiscales, scales);
+                let new_scale = [
+                    scale[0] * current_scale[indices[0]],
+                    scale[1] * current_scale[indices[1]],
+                ];
+                scales.insert(
+                    current_key.into(),
+                    new_scale
+                        .iter()
+                        .map(|val| val.round() as u64)
+                        .max()
+                        .expect("should have a maxmimum value"),
+                );
+                insert_scales(current_key, &new_scale[..], multiscales, scales, indices);
             }
         }
     }
 }
 
-pub(crate) fn get_scales(multiscales: Multiscales) -> HashMap<String, [f64; 2]> {
+/// Calculate absolute scales from the multiscales DAG
+pub(crate) fn abs_scales(
+    base_res: [f64; 2],
+    multiscales: &Multiscales,
+    indices: &[usize],
+) -> HashMap<String, u64> {
     let mut scales = HashMap::with_capacity(multiscales.layout.len());
-
     let root_key = multiscales
         .layout
         .iter()
         .find(|item| item.derived_from.is_none())
         .map_or(String::new(), |root| root.asset.clone());
+    let root_scale = base_res;
 
-    scales.insert(root_key, [1.0, 1.0]);
-
-    for layout in multiscales.layout {
-        let transform = layout.transform;
-    }
+    scales.insert(
+        root_key.clone(),
+        root_scale
+            .iter()
+            .map(|val| val.round() as u64)
+            .max()
+            .expect("should have a maximum value"),
+    );
+    insert_scales(
+        root_key.as_str(),
+        &root_scale[..],
+        &multiscales,
+        &mut scales,
+        indices,
+    );
 
     scales
-}
-
-/// Get dimension names
-pub(crate) async fn get_dimension_names<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<Vec<String>, ZarrError> {
-    let root_group = Group::async_open(store, NodePath::root().as_str())
-        .await
-        .map_err(ZarrError::GroupCreateError)?;
-
-    let names = root_group
-        .attributes()
-        .get("dimension_names")
-        .ok_or_else(|| ZarrError::AttributeError("dimension_names is missing".into()))?;
-
-    serde_json::from_value::<Vec<_>>(names.clone())
-        .map_err(|e| ZarrError::AttributeError(format!("Invalid dimension_names: {e}")))
-}
-
-pub(crate) fn get_spatial_dims_indices(
-    spatial_dims: &[&str],
-    dimension_names: &[DimensionName],
-) -> Vec<usize> {
-    let mut result = Vec::new();
-    for &spatial_dim in spatial_dims {
-        if let Some(val) = dimension_names
-            .iter()
-            .position(|name| name.as_deref() == Some(spatial_dim))
-        {
-            result.push(val);
-        }
-    }
-
-    result
-}
-
-/// Get the affine transformation from pixel space to geographic space
-pub(crate) async fn get_spatial_transform<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<[f64; 6], ZarrError> {
-    let root_group = Group::async_open(store, NodePath::root().as_str())
-        .await
-        .map_err(ZarrError::GroupCreateError)?;
-
-    let transform_value = root_group
-        .attributes()
-        .get("spatial:transform")
-        .ok_or_else(|| ZarrError::AttributeError("spatial:transform is missing".into()))?;
-
-    serde_json::from_value::<[f64; 6]>(transform_value.clone())
-        .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:transform format: {e}")))
-}
-
-/// Get the bounding box
-pub(crate) async fn get_bbox<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<[f64; 4], ZarrError> {
-    let root_group = Group::async_open(store, NodePath::root().as_str())
-        .await
-        .map_err(ZarrError::GroupCreateError)?;
-
-    let bbox = root_group
-        .attributes()
-        .get("spatial:bbox")
-        .ok_or_else(|| ZarrError::AttributeError("spatial:transform is missing".into()))?;
-
-    serde_json::from_value::<[f64; 4]>(bbox.clone())
-        .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:transform format: {e}")))
-}
-
-/// Get the shape of the source array
-pub(crate) async fn get_spatial_shape<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<[u64; 2], ZarrError> {
-    let root_group = Group::async_open(store, NodePath::root().as_str())
-        .await
-        .map_err(ZarrError::GroupCreateError)?;
-
-    let spatial_shape = root_group
-        .attributes()
-        .get("spatial:shape")
-        .ok_or_else(|| ZarrError::AttributeError("spatial:shape is missing".into()))?;
-
-    serde_json::from_value::<[u64; 2]>(spatial_shape.clone())
-        .map_err(|e| ZarrError::AttributeError(format!("Invalid spatial:shape format: {e}")))
 }
 
 /// Convert fill value to f32
@@ -301,61 +375,6 @@ pub(crate) fn fill_value_f32(fill_value: &FillValue) -> Result<f32, ZarrError> {
         .map_err(ZarrError::FillValueError)?;
 
     Ok(f32::from_ne_bytes(bytes))
-}
-
-/// Get the spatial registration of the source array
-pub(crate) async fn get_spatial_registration<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<SpatialRegistration, ZarrError> {
-    let root_group = Group::async_open(store, NodePath::root().as_str())
-        .await
-        .map_err(ZarrError::GroupCreateError)?;
-
-    let registration = root_group
-        .attributes()
-        .get("spatial:registration")
-        .and_then(|val| val.as_str())
-        .ok_or_else(|| ZarrError::AttributeError("spatial:registration is missing".into()))?;
-
-    match registration {
-        "node" => Ok(SpatialRegistration::Node),
-        "pixel" => Ok(SpatialRegistration::Pixel),
-        _ => Err(ZarrError::AttributeError(format!(
-            "invalid value for spatial:registration: {registration}"
-        ))),
-    }
-}
-
-/// Returns the names of the spatial dimensions
-pub(crate) fn get_spatial_dims(array: &Array<FilesystemStore>) -> Option<Vec<&str>> {
-    array
-        .attributes()
-        .get("spatial:dimensions")
-        .and_then(|val| val.as_array())
-        .and_then(|dims| dims.iter().map(|dim| dim.as_str()).collect())
-}
-
-/// Returns the names of non-spatial dimensions
-pub(crate) fn _get_non_spatial_dims(
-    array: &Array<FilesystemStore>,
-    spatial_dims: &Vec<&str>,
-) -> Result<Vec<String>, Box<dyn Error>> {
-    let mut non_spatial = vec![];
-
-    let dim_names = array
-        .dimension_names()
-        .as_ref()
-        .ok_or("Could not retrieve dimension names")?;
-
-    for name in dim_names.iter().flatten() {
-        let spatial = spatial_dims.iter().any(|&spatial_dim| spatial_dim == name);
-
-        if !spatial {
-            non_spatial.push(name.clone());
-        }
-    }
-
-    Ok(non_spatial)
 }
 
 /// Retrieve tile data from array
@@ -902,32 +921,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_spatial_transform() {
+    async fn test_data_vars() {
         let store = get_zarr_store();
-        let transform = get_spatial_transform(store)
+        let nodes = data_variables(store)
             .await
-            .expect("could not get transform");
-
-        assert_eq!(transform, [1000.0, 0.0, 19500.0, 0.0, -1000.0, 620500.0]);
+            .expect("should have data variables");
+        let paths = nodes
+            .into_iter()
+            .map(|node| node.path().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                NodePath::new("/0/air").expect("should be valid"),
+                NodePath::new("/1/air").expect("should be valid")
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn test_get_bbox() {
+    async fn test_proj() {
         let store = get_zarr_store();
-        let bbox = get_bbox(store).await.expect("could not get bounding box");
-
-        assert_eq!(bbox, [19500.0, 189500.0, 720500.0, 620500.0]);
+        let root_node = Node::async_open(Arc::clone(&store), "/")
+            .await
+            .expect("should have root group");
+        let src_crs = get_proj(&root_node).expect("should have crs");
+        assert_eq!(src_crs.as_str(), "EPSG:4326");
     }
 
     #[tokio::test]
-    async fn test_get_multiscales() {
+    async fn test_spatial_res() {
         let store = get_zarr_store();
-        let multiscales = get_multiscales(store)
+        let root_node = Node::async_open(Arc::clone(&store), "/")
             .await
+            .expect("should have root group");
+        let bbox = get_bbox(&root_node)
+            .expect("could not get bounding box")
+            .expect("should have bounding box");
+        let shape = get_spatial_shape(&root_node)
+            .expect("could not get spatial shape")
+            .expect("could not get spatial shape");
+        let res = spatial_resolutions(&shape, &bbox);
+        assert_eq!(res, [2.5, 2.5]);
+    }
+
+    #[tokio::test]
+    async fn test_get_indices() {
+        let store = get_zarr_store();
+        let data_var = Array::async_open(Arc::clone(&store), "/0/air")
+            .await
+            .expect("should have array");
+        let root_node = Node::async_open(Arc::clone(&store), "/")
+            .await
+            .expect("should have root group");
+        let spatial_dims = get_spatial_dims(&root_node)
+            .expect("should have spatial:dimensions")
+            .expect("should have spatial:dimensions");
+        let dimension_names = data_var
+            .dimension_names()
+            .as_deref()
+            .expect("should have dimension names");
+        let indices = get_spatial_dims_indices(spatial_dims.as_slice(), dimension_names)
+            .expect("should have indices");
+        assert_eq!(indices, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_abs_scales() {
+        let store = get_zarr_store();
+        let data_var = Array::async_open(Arc::clone(&store), "/0/air")
+            .await
+            .expect("should have array");
+        let root_node = Node::async_open(Arc::clone(&store), "/")
+            .await
+            .expect("should have root group");
+        let spatial_dims = get_spatial_dims(&root_node)
+            .expect("should have spatial:dimensions")
+            .expect("should have spatial:dimensions");
+        let dimension_names = data_var
+            .dimension_names()
+            .as_deref()
+            .expect("should have dimension names");
+        let indices = get_spatial_dims_indices(spatial_dims.as_slice(), dimension_names)
+            .expect("should have indices");
+        let multiscales = get_multiscales(&root_node)
             .expect("could not get transform")
             .expect("should have multiscales");
-
-        println!("{multiscales:?}");
+        let scales = abs_scales([1.0, 1.0], &multiscales, &indices[..]);
+        let first = scales.get("1");
+        assert_eq!(first, Some(&2));
     }
 
     #[test]
@@ -944,7 +1026,7 @@ mod tests {
 
     #[test]
     fn test_warp_grid_size() {
-        let (warp_grid, warp_grid_bbox) = calculate_warp_grid_for_bbox(
+        let (warp_grid, _warp_grid_bbox) = calculate_warp_grid_for_bbox(
             [0.0, 0.0, 4.0, 4.0],
             "EPSG:4326",
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
@@ -1071,12 +1153,18 @@ mod tests {
         let datetime = DateTime::parse_from_rfc3339(time_str)
             .expect("msg")
             .with_timezone(&Utc);
-
         let time_coords = time_coords(Arc::clone(&store)).await.unwrap().map(Arc::new);
-        let src_transform = get_spatial_transform(Arc::clone(&store)).await.unwrap();
-        let src_bbox = get_bbox(Arc::clone(&store)).await.unwrap();
-        let src_shape = get_spatial_shape(Arc::clone(&store)).await.unwrap();
-        let src_crs = get_proj_code(Arc::clone(&store)).await.unwrap();
+
+        let root_node = Node::async_open(Arc::clone(&store), "/")
+            .await
+            .expect("should have root group");
+        let src_transform = get_spatial_transform(&root_node)
+            .expect("could not get spatial:transform")
+            .expect("should have spatial transform");
+        let src_shape = get_spatial_shape(&root_node)
+            .expect("could not get spatial shpae")
+            .expect("could not get spatial shape");
+        let src_crs = get_proj(&root_node).expect("should have crs");
         let (warp_grid, warp_grid_bbox) = calculate_warp_grid(
             tile,
             src_transform,

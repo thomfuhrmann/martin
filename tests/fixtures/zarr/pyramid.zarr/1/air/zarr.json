@@ -1,6 +1,9 @@
 {
   "attributes": {
-    "actual_range": [185.16000366210938, 322.1000061035156],
+    "actual_range": [
+      185.16000366210938,
+      322.1000061035156
+    ],
     "coordinates": "spatial_ref",
     "dataset": "NMC Reanalysis",
     "GRIB_id": 11,
@@ -15,7 +18,11 @@
   },
   "chunk_grid": {
     "configuration": {
-      "chunk_shape": [128, 12, 26]
+      "chunk_shape": [
+        128,
+        12,
+        26
+      ]
     },
     "name": "regular"
   },
@@ -28,7 +35,11 @@
   "codecs": [
     {
       "configuration": {
-        "chunk_shape": [1, 12, 26],
+        "chunk_shape": [
+          1,
+          12,
+          26
+        ],
         "codecs": [
           {
             "configuration": {
@@ -61,10 +72,18 @@
     }
   ],
   "data_type": "float64",
-  "dimension_names": ["time", "lat", "lon"],
+  "dimension_names": [
+    "time",
+    "lat",
+    "lon"
+  ],
   "fill_value": "NaN",
   "node_type": "array",
-  "shape": [2920, 12, 26],
+  "shape": [
+    2920,
+    12,
+    26
+  ],
   "storage_transformers": [],
   "zarr_format": 3
 }
