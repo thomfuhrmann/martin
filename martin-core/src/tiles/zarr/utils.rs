@@ -7,10 +7,8 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::{ops::Range, sync::Arc};
-use zarrs::array::FillValue;
+use zarrs::array::{DataType, FillValue};
 use zarrs::group::GroupMetadata;
-use zarrs::node::async_get_child_nodes;
-use zarrs::storage::{AsyncListableStorageTraits, AsyncReadableStorageTraits};
 use zarrs::{
     array::{Array, ArrayMetadata, DimensionName},
     node::{Node, NodeMetadata, NodePath},
@@ -26,6 +24,7 @@ use serde::Deserialize;
 #[derive(Deserialize, Debug, Clone)]
 pub(crate) struct Multiscales {
     pub(crate) layout: Vec<LayoutItem>,
+    #[allow(dead_code)]
     pub(crate) resampling_method: Option<String>,
 }
 
@@ -38,13 +37,32 @@ pub(crate) struct LayoutItem {
     pub(crate) spatial_shape: Option<[u64; 2]>,
     pub(crate) derived_from: Option<String>,
     pub(crate) transform: Option<Transform>,
+    #[allow(dead_code)]
     pub(crate) resampling_method: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub(crate) struct Transform {
     scale: Option<Vec<f64>>,
+    #[allow(dead_code)]
     translation: Option<Vec<f64>>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub(crate) enum Proj {
+    Code(String),
+    Wkt2(String),
+    Projjson(Value),
+}
+
+impl Proj {
+    pub fn into_string(self) -> String {
+        match self {
+            Proj::Code(code) => code,
+            Proj::Wkt2(wkt) => wkt,
+            Proj::Projjson(value) => value.to_string(),
+        }
+    }
 }
 
 pub(crate) const TILE_PIXELS: u32 = 512;
@@ -70,7 +88,7 @@ pub(crate) fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
 }
 
 /// Check if the array is a data variable
-fn is_data_variable(node: &Node) -> Result<bool, ZarrError> {
+pub(crate) fn is_data_variable(node: &Node) -> Result<bool, ZarrError> {
     let metadata = node.metadata();
     let path = node.path().as_str();
 
@@ -106,51 +124,33 @@ fn is_data_variable(node: &Node) -> Result<bool, ZarrError> {
 
 /// Helper function for node traversal
 fn visit_nodes_recursive(node: &Node, nodes: &mut Vec<Node>) {
-    if is_data_variable(node).is_ok_and(|val| val) {
-        nodes.push(node.clone())
-    };
-
     for child in node.children() {
+        nodes.push(child.clone());
         visit_nodes_recursive(child, nodes);
     }
 }
 
-/// Retrieve all data variables of this store - arrays that are not coordinates
-pub(crate) async fn data_variables<T: ObjectStore>(
+/// Retrieve all nodes
+pub(crate) async fn zarr_nodes<T: ObjectStore>(
     store: Arc<AsyncObjectStore<T>>,
 ) -> Result<Vec<Node>, ZarrError> {
-    let root_path = NodePath::root();
-    let child_nodes = async_get_child_nodes(&store, &root_path, true)
-        .await
-        .map_err(ZarrError::NodeCreateError)?;
     let mut nodes = Vec::new();
-    for node in child_nodes {
-        visit_nodes_recursive(&node, &mut nodes);
-    }
+    let root_path = NodePath::root();
+    let root_node = Node::async_open(Arc::clone(&store), root_path.as_str())
+        .await
+        .map_err(|e| ZarrError::NodeCreateError(e))?;
+    nodes.push(root_node.clone());
+    visit_nodes_recursive(&root_node, &mut nodes);
     Ok(nodes)
 }
 
-/// Retrieve time array
-pub(crate) async fn time_coords<
-    S: AsyncReadableStorageTraits + AsyncListableStorageTraits + 'static,
->(
-    store: Arc<S>,
-) -> Result<Option<Array<S>>, ZarrError> {
-    let root_path = NodePath::root();
-    let child_nodes = async_get_child_nodes(&store, &root_path, true)
-        .await
-        .map_err(ZarrError::NodeCreateError)?;
-    let time_node_path = child_nodes
+/// Retrieve time array path from immediate children
+pub(crate) fn time_array_path(node: &Node) -> Option<NodePath> {
+    let child_nodes = node.children();
+    child_nodes
         .into_iter()
         .find(|n| n.name().as_str() == "time")
-        .map(|n| n.path().clone());
-    if let Some(node_path) = time_node_path {
-        let array = Array::async_open(store, node_path.as_str())
-            .await
-            .map_err(ZarrError::ArrayCreateError)?;
-        return Ok(Some(array));
-    }
-    Ok(None)
+        .map(|n| n.path().clone())
 }
 
 pub(crate) fn node_attributes(node: &Node) -> Map<String, Value> {
@@ -166,18 +166,17 @@ pub(crate) fn node_attributes(node: &Node) -> Map<String, Value> {
 ///
 /// At least one of proj:code, proj:wkt2, or proj:projjson MUST be provided.
 /// Inherited to direct child arrays of a group. Can be overriden at array level.
-pub(crate) fn get_proj(node: &Node) -> Option<String> {
+pub(crate) fn get_proj(node: &Node) -> Option<Proj> {
     let attributes = node_attributes(node);
-    node_attributes(node)
-        .get("proj:code")
-        .or_else(|| attributes.get("proj:wkt2"))
-        .and_then(|val| val.as_str().map(|s| s.to_string()))
-        .or_else(|| {
-            attributes.get("proj:projjson").map(|val| match val {
-                Value::Object(_) => val.to_string(),
-                _ => val.to_string(),
-            })
-        })
+    if let Some(code) = attributes.get("proj:code").and_then(|v| v.as_str()) {
+        Some(Proj::Code(code.to_string()))
+    } else if let Some(wkt) = attributes.get("proj:wkt2").and_then(|v| v.as_str()) {
+        Some(Proj::Wkt2(wkt.to_string()))
+    } else if let Some(json) = attributes.get("proj:projjson") {
+        Some(Proj::Projjson(json.clone()))
+    } else {
+        None
+    }
 }
 
 /// Get spatial dimension names
@@ -219,7 +218,9 @@ pub(crate) fn get_spatial_dims_indices<T: AsRef<str>>(
 
 /// Get the affine transformation from pixel space to geographic space
 ///
-///  Required when spatial:transform_type is "affine"
+/// Required when spatial:transform_type is "affine" (which is the default if omitted).
+/// The transform operates on array indices where (0, 0) is at the top-left corner of the top-left pixel, and (width, height) is at the bottom-right corner of the bottom-right pixel.
+/// The center of the top-left pixel is at (0.5, 0.5).
 pub(crate) fn get_spatial_transform(node: &Node) -> Result<Option<[f64; 6]>, ZarrError> {
     node_attributes(node)
         .get("spatial:transform")
@@ -324,7 +325,7 @@ fn insert_scales(
                     current_key.into(),
                     new_scale
                         .iter()
-                        .map(|val| val.round() as u64)
+                        .map(|val| val.ceil() as u64)
                         .max()
                         .expect("should have a maxmimum value"),
                 );
@@ -352,7 +353,7 @@ pub(crate) fn abs_scales(
         root_key.clone(),
         root_scale
             .iter()
-            .map(|val| val.round() as u64)
+            .map(|val| val.ceil() as u64)
             .max()
             .expect("should have a maximum value"),
     );
@@ -367,6 +368,25 @@ pub(crate) fn abs_scales(
     scales
 }
 
+/// Find matching layout item for given tile
+pub(crate) fn find_layout_item(
+    xyz: TileCoord,
+    layout_items: Option<&HashMap<u64, LayoutItem>>,
+) -> Option<&LayoutItem> {
+    if let Some(layout_items) = layout_items {
+        let target_res = tile_res(xyz.z);
+        let (_, layout_item) = layout_items
+            .iter()
+            .filter(|(scale_key, _)| **scale_key <= target_res)
+            .max_by_key(|(scale_key, _)| **scale_key)
+            .or_else(|| layout_items.iter().max_by_key(|(scale_key, _)| **scale_key))
+            .expect("at least one item should match");
+        Some(layout_item)
+    } else {
+        None
+    }
+}
+
 /// Convert fill value to f32
 pub(crate) fn fill_value_f32(fill_value: &FillValue) -> Result<f32, ZarrError> {
     let bytes: [u8; 4] = fill_value
@@ -375,6 +395,36 @@ pub(crate) fn fill_value_f32(fill_value: &FillValue) -> Result<f32, ZarrError> {
         .map_err(ZarrError::FillValueError)?;
 
     Ok(f32::from_ne_bytes(bytes))
+}
+
+/// Convert fill value to f64
+pub(crate) fn fill_value_f64(fill_value: &FillValue) -> Result<f64, ZarrError> {
+    let bytes: [u8; 8] = fill_value
+        .as_ne_bytes()
+        .try_into()
+        .map_err(ZarrError::FillValueError)?;
+
+    Ok(f64::from_ne_bytes(bytes))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ZarrFillValue {
+    F32(f32),
+    // F64(f64),
+}
+
+/// Convert based on data type
+pub(crate) fn fill_value(
+    fill_value: &FillValue,
+    data_type: &DataType,
+) -> Result<ZarrFillValue, ZarrError> {
+    match data_type.name(ZarrVersion::V3).as_deref() {
+        Some("float32") => fill_value_f32(fill_value).map(|val| ZarrFillValue::F32(val)),
+        // Some("float64") => fill_value_f64(fill_value).map(|val| ZarrFillValue::F64(val)),
+        Some("float64") => fill_value_f64(fill_value).map(|val| ZarrFillValue::F32(val as f32)),
+        Some(_) => Err(ZarrError::CastError("Unsupported data type".into())),
+        None => Err(ZarrError::CastError("Could not cast fill value".into())),
+    }
 }
 
 /// Retrieve tile data from array
@@ -391,7 +441,6 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
         time_range = Some(temporal_index..temporal_index + 1);
     }
 
-    // permute tile data to have a fixed order: time, y, x
     let dimension_names = data_var
         .dimension_names()
         .as_deref()
@@ -407,7 +456,6 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
     let y_range = warp_grid_bbox[1]..y_end;
 
     let ranges = build_ranges(dimension_names, time_range.as_ref(), y_range, x_range)?;
-    let perm = order_dimensions(dimension_names);
 
     let tile_data = match ranges.len() {
         3 => match data_var.data_type().name(ZarrVersion::V3).as_deref() {
@@ -417,7 +465,16 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
                     .await
                     .map_err(ZarrError::ArrayError)?;
 
-                data.permuted_axes([perm[0], perm[1], perm[2]])
+                data
+            }
+            Some("float64") => {
+                let data = data_var
+                    .async_retrieve_array_subset::<ndarray::Array3<f64>>(&ranges)
+                    .await
+                    .map_err(ZarrError::ArrayError)?
+                    .mapv(|val| val as f32);
+
+                data
             }
             _ => return Err(ZarrError::CastError("Unimplemented data type".into())),
         },
@@ -429,8 +486,16 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
                     .await
                     .map_err(ZarrError::ArrayError)?;
 
-                data.permuted_axes([perm[0], perm[1]])
-                    .insert_axis(ndarray::Axis(0))
+                data.insert_axis(ndarray::Axis(0))
+            }
+            Some("float64") => {
+                let data = data_var
+                    .async_retrieve_array_subset::<ndarray::Array2<f64>>(&ranges)
+                    .await
+                    .map_err(ZarrError::ArrayError)?
+                    .mapv(|val| val as f32);
+
+                data.insert_axis(ndarray::Axis(0))
             }
             _ => return Err(ZarrError::CastError("Unimplemented data type".into())),
         },
@@ -451,13 +516,18 @@ pub(crate) fn sample_data(
     warp_grid_bbox: [u64; 4],
     tile_data: &ndarray::Array3<f32>,
     tile_len: u32,
-    fill_value: f32,
+    fill_value: ZarrFillValue,
     min: f32,
     max: f32,
 ) -> Result<Vec<u8>, ZarrError> {
     // sample from array at warp grid points
-    let (sampled_data, _min, _max) =
-        sample_warp_grid(warp_grid, warp_grid_bbox, tile_data, tile_len, fill_value)?;
+    let (sampled_data, _min, _max) = sample_warp_grid(
+        warp_grid,
+        warp_grid_bbox,
+        tile_data,
+        tile_len,
+        fill_value.clone(),
+    )?;
 
     // cast to raw bytes
     // let raw_bytes = bytemuck::cast_slice::<f32, u8>(&sampled_data);
@@ -484,7 +554,7 @@ fn sampled_data_to_png(
     height: u32,
     min: f32,
     max: f32,
-    fill_value: f32,
+    fill_value: ZarrFillValue,
 ) -> Result<Vec<u8>, ZarrError> {
     if sampled_data.len() != (width * height) as usize {
         return Err(ZarrError::DimensionError(format!(
@@ -504,8 +574,11 @@ fn sampled_data_to_png(
     };
 
     for (i, &value) in sampled_data.iter().enumerate() {
-        let is_nodata =
-            value.is_nan() || fill_value.is_nan() || (value - fill_value).abs() < f32::EPSILON;
+        let is_nodata = match fill_value {
+            ZarrFillValue::F32(fill_value) => {
+                value.is_nan() || fill_value.is_nan() || (value - fill_value).abs() < f32::EPSILON
+            }
+        };
 
         let pixel = if is_nodata {
             [0, 0] // Transparent (Luma=0, Alpha=0)
@@ -536,12 +609,15 @@ fn sample_warp_grid(
     warp_grid_bbox: [u64; 4],
     tile_data: &ndarray::Array3<f32>,
     tile_len: u32,
-    fill_value: f32,
+    fill_value: ZarrFillValue,
 ) -> Result<(Box<[f32]>, f32, f32), ZarrError> {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
-    let mut sampled_data =
-        vec![fill_value; tile_len as usize * tile_len as usize].into_boxed_slice();
+    let mut sampled_data = match fill_value {
+        ZarrFillValue::F32(fill_value) => {
+            vec![fill_value; tile_len as usize * tile_len as usize].into_boxed_slice()
+        }
+    };
 
     for i in 0..tile_len {
         for j in 0..tile_len {
@@ -590,8 +666,8 @@ pub(crate) fn calculate_warp_grid(
     calculate_warp_grid_for_bbox(
         tile_bbox(tile.x, tile.y, tile.z),
         TARGET_CRS,
-        src_transform,
         src_crs,
+        src_transform,
         src_shape,
         TILE_PIXELS,
         spatial_registration,
@@ -601,8 +677,8 @@ pub(crate) fn calculate_warp_grid(
 fn calculate_warp_grid_for_bbox(
     tile_bbox: [f64; 4],
     target_crs: &str,
-    src_transform: [f64; 6],
     src_crs: &str,
+    src_transform: [f64; 6],
     src_shape: [u64; 2],
     tile_len: u32,
     spatial_registration: &SpatialRegistration,
@@ -636,15 +712,22 @@ fn calculate_warp_grid_for_bbox(
     #[allow(clippy::cast_precision_loss)]
     let height = src_shape[0] as f64;
 
+    let src_uses_0_360 = src_transform[2] > 180.0
+        || (src_transform[2] + src_transform[0] * src_shape[1] as f64) > 180.0;
+
     let mut has_valid_pixel = false;
     for i in 0..tile_len {
         for j in 0..tile_len {
             let x_target = x_min_target + (f64::from(i) + 0.5) * x_scale_target;
             let y_target = y_max_target - (f64::from(j) + 0.5) * y_scale_target;
 
-            let (x_src, y_src) = inv_trafo
+            let (mut x_src, y_src) = inv_trafo
                 .convert((x_target, y_target))
                 .map_err(ZarrError::ProjError)?;
+
+            if src_uses_0_360 && x_src < 0.0 {
+                x_src += 360.0;
+            }
 
             let right = match spatial_registration {
                 SpatialRegistration::Pixel => {
@@ -747,20 +830,11 @@ fn build_ranges(
                 .ok_or_else(|| ZarrError::TimeError("Missing time array indices".into())),
             Some("y") => Ok(y.clone()),
             Some("x") => Ok(x.clone()),
+            Some("lat") => Ok(y.clone()),
+            Some("lon") => Ok(x.clone()),
             _ => Err(ZarrError::DimensionError(format!(
                 "Unknown dimension: {name:?}"
             ))),
-        })
-        .collect()
-}
-
-fn order_dimensions(names: &[DimensionName]) -> Vec<usize> {
-    ["time", "y", "x"]
-        .iter()
-        .filter_map(|&dimension| {
-            names
-                .iter()
-                .position(|name| name.as_deref() == Some(dimension))
         })
         .collect()
 }
@@ -827,6 +901,16 @@ impl TimeMetadata {
         let name = data_type.name(ZarrVersion::V3);
 
         let data_time = match name.as_deref() {
+            Some("int32") => time_coords
+                .async_retrieve_array_subset::<ndarray::Array1<i32>>(&time_coords.subset_all())
+                .await
+                .map_err(ZarrError::ArrayError)?
+                .mapv(|val| val as f64),
+            Some("int64") => time_coords
+                .async_retrieve_array_subset::<ndarray::Array1<i64>>(&time_coords.subset_all())
+                .await
+                .map_err(ZarrError::ArrayError)?
+                .mapv(|val| val as f64),
             Some("float32") => time_coords
                 .async_retrieve_array_subset::<ndarray::Array1<f32>>(&time_coords.subset_all())
                 .await
@@ -923,9 +1007,7 @@ mod tests {
     #[tokio::test]
     async fn test_data_vars() {
         let store = get_zarr_store();
-        let nodes = data_variables(store)
-            .await
-            .expect("should have data variables");
+        let nodes = zarr_nodes(store).await.expect("should have data variables");
         let paths = nodes
             .into_iter()
             .map(|node| node.path().clone())
@@ -946,7 +1028,7 @@ mod tests {
             .await
             .expect("should have root group");
         let src_crs = get_proj(&root_node).expect("should have crs");
-        assert_eq!(src_crs.as_str(), "EPSG:4326");
+        assert_eq!(src_crs, Proj::Code("EPSG:4326".into()));
     }
 
     #[tokio::test]
@@ -1029,8 +1111,8 @@ mod tests {
         let (warp_grid, _warp_grid_bbox) = calculate_warp_grid_for_bbox(
             [0.0, 0.0, 4.0, 4.0],
             "EPSG:4326",
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             [4, 4],
             4,
             &SpatialRegistration::Pixel,
@@ -1046,8 +1128,8 @@ mod tests {
         let result = calculate_warp_grid_for_bbox(
             [0.0, 0.0, 4.0, 4.0],
             "EPSG:4326",
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             [4, 4],
             4,
             &SpatialRegistration::Pixel,
@@ -1072,8 +1154,8 @@ mod tests {
         let result = calculate_warp_grid_for_bbox(
             [5.0, 10.0, 7.0, 12.0],
             "EPSG:4326",
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             [4, 4],
             4,
             &SpatialRegistration::Pixel,
@@ -1088,8 +1170,8 @@ mod tests {
         let result = calculate_warp_grid_for_bbox(
             [2.0, 2.0, 5.0, 5.0],
             "EPSG:4326",
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             [4, 4],
             4,
             &SpatialRegistration::Pixel,
@@ -1122,8 +1204,8 @@ mod tests {
         let (warp_grid, warp_grid_bbox) = calculate_warp_grid_for_bbox(
             [0.0, 0.0, 4.0, 4.0],
             "EPSG:4326",
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             "EPSG:4326",
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             [4, 4],
             4,
             &SpatialRegistration::Pixel,
@@ -1131,8 +1213,14 @@ mod tests {
         .expect("could not calculate warp grid")
         .expect("should be some");
 
-        let (sampled_data, min, max) = sample_warp_grid(&warp_grid, warp_grid_bbox, &data, 4, 0.0)
-            .expect("could not calculate warp grid");
+        let (sampled_data, min, max) = sample_warp_grid(
+            &warp_grid,
+            warp_grid_bbox,
+            &data,
+            4,
+            ZarrFillValue::F32(0.0),
+        )
+        .expect("could not calculate warp grid");
 
         assert_eq!(sampled_data[6], 22.0);
         assert_eq!(min, 0.0);
@@ -1140,24 +1228,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fill_value() {
+        let store = get_zarr_store();
+        let data_var = Array::async_open(Arc::clone(&store), "/0/air")
+            .await
+            .unwrap();
+        let fill_value = fill_value(data_var.fill_value(), data_var.data_type())
+            .expect("should have fill value");
+        match fill_value {
+            ZarrFillValue::F32(val) => assert!(val.is_nan()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_calculate_warp_grid() {
+        let (warp_grid, _warp_grid_bbox) = calculate_warp_grid(
+            TileCoord { z: 5, x: 3, y: 10 },
+            [5.0, 0.0, 198.75, 0.0, -5.0, 76.25],
+            "EPSG:4326",
+            [12, 26],
+            &SpatialRegistration::Pixel,
+        )
+        .expect("could not calculate warp grid")
+        .expect("should be some");
+
+        println!("{warp_grid:?}");
+    }
+
+    #[tokio::test]
     async fn test_sample_tile() {
         let store = get_zarr_store();
-        let data_var = Array::async_open(Arc::clone(&store), "/liquid_water")
+        let data_var = Array::async_open(Arc::clone(&store), "/0/air")
             .await
             .unwrap();
 
         let tile = TileCoord::new_checked(6, 34, 22).unwrap();
 
+        let root_node = Node::async_open(Arc::clone(&store), "/")
+            .await
+            .expect("should have root group");
+
         // time
+        let first_node = Node::async_open(Arc::clone(&store), "/0")
+            .await
+            .expect("should have at least one group");
         let time_str = "2026-08-13T00:04:00.000Z";
         let datetime = DateTime::parse_from_rfc3339(time_str)
             .expect("msg")
             .with_timezone(&Utc);
-        let time_coords = time_coords(Arc::clone(&store)).await.unwrap().map(Arc::new);
+        let time_path = time_array_path(&first_node).expect("should have time");
+        let time_array = Some(Arc::new(
+            Array::async_open(Arc::clone(&store), time_path.as_str())
+                .await
+                .map_err(ZarrError::ArrayCreateError)
+                .expect("should open"),
+        ));
 
-        let root_node = Node::async_open(Arc::clone(&store), "/")
-            .await
-            .expect("should have root group");
         let src_transform = get_spatial_transform(&root_node)
             .expect("could not get spatial:transform")
             .expect("should have spatial transform");
@@ -1168,22 +1294,21 @@ mod tests {
         let (warp_grid, warp_grid_bbox) = calculate_warp_grid(
             tile,
             src_transform,
-            src_crs.as_str(),
+            &src_crs.into_string(),
             src_shape,
             &SpatialRegistration::Pixel,
         )
         .expect("could not calculate warp grid")
         .expect("should be some");
-        let tile_data =
-            retrieve_tile_data(warp_grid_bbox, time_coords.clone(), datetime, &data_var)
-                .await
-                .expect("could not retrieve tile data");
+        let tile_data = retrieve_tile_data(warp_grid_bbox, time_array.clone(), datetime, &data_var)
+            .await
+            .expect("could not retrieve tile data");
         let res = sample_data(
             &warp_grid,
             warp_grid_bbox,
             &tile_data,
             TILE_PIXELS,
-            0.0,
+            ZarrFillValue::F32(0.0),
             0.1,
             90.7,
         );

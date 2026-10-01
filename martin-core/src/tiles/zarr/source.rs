@@ -22,14 +22,13 @@ use crate::CacheZoomRange;
 use crate::tiles::zarr::cache::{WarpCache, WarpCacheKey};
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::utils::{
-    LayoutItem, TILE_PIXELS, WarpGrid, abs_scales, calculate_warp_grid, data_variables,
-    fill_value_f32, get_bbox, get_multiscales, get_proj, get_spatial_dims,
-    get_spatial_dims_indices, get_spatial_registration, get_spatial_transform, retrieve_tile_data,
-    sample_data, spatial_resolutions, tile_res, time_coords,
+    LayoutItem, Proj, TILE_PIXELS, WarpGrid, ZarrFillValue, abs_scales, calculate_warp_grid,
+    fill_value, find_layout_item, get_bbox, get_multiscales, get_proj, get_spatial_dims,
+    get_spatial_dims_indices, get_spatial_registration, get_spatial_shape, get_spatial_transform,
+    is_data_variable, retrieve_tile_data, sample_data, spatial_resolutions, time_array_path,
+    zarr_nodes,
 };
 use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
-
-// TODO: implement multiscales Zarr convention: https://github.com/zarr-conventions/multiscales
 
 /// Currently no pyramids - therefore full zoom range
 const MIN_ZOOM: u8 = 0;
@@ -52,15 +51,15 @@ pub struct ZarrSource<T: ObjectStore + Clone> {
     tileinfo: TileInfo,
     min_zoom: u8,
     max_zoom: u8,
-    time_coords: Option<Arc<Array<AsyncObjectStore<T>>>>,
+    time_arrays: HashMap<String, Arc<Array<AsyncObjectStore<T>>>>,
     data_vars: Arc<HashMap<String, Array<AsyncObjectStore<T>>>>,
-    src_crs: String,
-    src_transform: [f64; 6],
-    src_shape: [u64; 2],
+    spatial_transform: [f64; 6],
+    spatial_shape: Option<[u64; 2]>,
     spatial_registration: SpatialRegistration,
     cache_zoom: CacheZoomRange,
     warp_cache: WarpCache,
     layout_items: Option<HashMap<u64, LayoutItem>>,
+    nodes: Vec<Node>,
 }
 
 impl<T: ObjectStore + Clone> Debug for ZarrSource<T> {
@@ -85,105 +84,158 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         // wrap object store for zarrs
         let zarr_store = Arc::new(AsyncObjectStore::new(object_store));
 
-        // get time coordinates
-        let time_coords = time_coords(Arc::clone(&zarr_store)).await?.map(Arc::new);
-
         // get spatial metadata
         // TODO: currently it is supposed that the metadata includes the following GeoZarr conventions: proj, spatial
         // multiscales is optional
+        // bbox is assumed to be present - could be calculated from affine transform as well
         let root_node = Node::async_open(Arc::clone(&zarr_store), "/")
             .await
             .map_err(|e| ZarrError::NodeCreateError(e))?;
-        let src_crs = get_proj(&root_node).unwrap_or("EPSG:4326".into());
-        let src_transform =
+        let src_crs = get_proj(&root_node).unwrap_or(Proj::Code("EPSG:4326".into()));
+        let spatial_transform =
             get_spatial_transform(&root_node)?.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-        let src_bbox = get_bbox(&root_node)?.unwrap_or([0.0, 0.0, 0.0, 0.0]);
+        let spatial_bbox = get_bbox(&root_node)?;
         let spatial_registration =
             get_spatial_registration(&root_node)?.unwrap_or(SpatialRegistration::Pixel);
-        let spatial_dims =
-            get_spatial_dims(&root_node)?.unwrap_or(vec!["lat".into(), "lon".into()]);
+        let mut spatial_dims = get_spatial_dims(&root_node)?;
         let multiscales = get_multiscales(&root_node)?;
-
-        // bounding box in tilejson needs to be in WGS84 - see <https://github.com/mapbox/tilejson-spec/tree/master/3.0.0#35-bounds>
-        let transformer = proj::Proj::try_from((src_crs.as_str(), "EPSG:4326"))
-            .map_err(ZarrError::ProjCreateError)?;
-        let (x_min, y_min) = transformer
-            .convert((src_bbox[0], src_bbox[1]))
-            .map_err(ZarrError::ProjError)?;
-        let (x_max, y_max) = transformer
-            .convert((src_bbox[2], src_bbox[3]))
-            .map_err(ZarrError::ProjError)?;
-        let bounds = Bounds::new(x_min, y_min, x_max, y_max);
-
-        let tilejson = tilejson! {
-            tiles: vec![],
-            minzoom: MIN_ZOOM,
-            maxzoom: MAX_ZOOM,
-            bounds: bounds
-        };
 
         // resolve paths to data variables
         let mut data_vars: HashMap<String, _> = HashMap::new();
-        let nodes = data_variables(Arc::clone(&zarr_store)).await?;
-        let mut src_shape = [0, 0];
+        let nodes = zarr_nodes(Arc::clone(&zarr_store)).await?;
         let mut dimension_names = None;
         let mut first = true;
         for node in &nodes {
-            let array = Array::async_open(Arc::clone(&zarr_store), node.path().as_str())
-                .await
-                .map_err(ZarrError::ArrayCreateError)?;
-            if first {
-                // assuming that the dimension names are the same for all arrays of this store
-                dimension_names = array.dimension_names().clone();
-                first = false;
-            }
-            data_vars.insert(node.path().as_str().into(), array);
+            if is_data_variable(node).is_ok_and(|val| val) {
+                let array = Array::async_open(Arc::clone(&zarr_store), node.path().as_str())
+                    .await
+                    .map_err(ZarrError::ArrayCreateError)?;
+                if first {
+                    // assuming that the dimension names are the same for all arrays of this store
+                    dimension_names = array.dimension_names().clone();
+                    if spatial_dims.is_none() {
+                        spatial_dims = get_spatial_dims(&node)?
+                    };
+
+                    first = false;
+                }
+                data_vars.insert(node.path().as_str().into(), array);
+            };
         }
 
         // get the base layout for multiscales
-        let base_layout = multiscales
-            .clone()
-            .and_then(|multi| {
-                multi
-                    .layout
-                    .iter()
-                    .find(|item| item.derived_from.is_none())
-                    .cloned()
-            })
-            .expect("should have base layout item");
+        let base_layout = multiscales.clone().and_then(|multi| {
+            multi
+                .layout
+                .iter()
+                .find(|item| item.derived_from.is_none())
+                .cloned()
+        });
+
+        let mut base_spatial_shape = get_spatial_shape(&root_node)?;
 
         // calculate absolute scales and corresponding layout items for multiscales
-        let mut layout_items = None;
-        if let Some(multiscales) = &multiscales {
-            if let Some(dimension_names) = dimension_names {
-                let shape = if let Some(shape) = &base_layout.spatial_shape {
-                    shape
-                } else {
-                    let base_path = base_layout.asset;
-                    let (_, arr) = data_vars
-                        .iter()
-                        .find(|(path, _)| path.starts_with(&base_path))
-                        .expect("should be at least one variable at base resolution level");
-                    arr.shape()
-                };
+        let layout_items = if let Some(multiscales) = &multiscales
+            && let Some(base_layout) = base_layout
+            && let Some(dimension_names) = dimension_names
+            && let Some(spatial_dims) = spatial_dims
+        {
+            let indices = get_spatial_dims_indices(spatial_dims.as_slice(), &dimension_names)?;
+            let spatial_shape = if let Some(spatial_shape) = &base_layout.spatial_shape {
+                [spatial_shape[0], spatial_shape[1]]
+            } else {
+                // get spatial shape from array
+                let base_path = base_layout.asset;
+                let (_, arr) = data_vars
+                    .iter()
+                    .find(|(path, _)| path.starts_with(&base_path))
+                    .expect("should be at least one variable at base resolution level");
+                let shape = arr.shape();
+                let spatial_shape = indices.iter().map(|&idx| shape[idx]).collect::<Vec<_>>();
+                [spatial_shape[0], spatial_shape[1]]
+            };
 
-                let indices = get_spatial_dims_indices(spatial_dims.as_slice(), &dimension_names)?;
-                let base_shape: Vec<u64> = indices.iter().map(|&idx| shape[idx]).collect();
-                src_shape = [base_shape[0], base_shape[1]];
-
-                let base_res = spatial_resolutions(&base_shape, &src_bbox);
-                let abs_scales = abs_scales(base_res, &multiscales, indices.as_slice());
-
-                let mut items = HashMap::new();
-                for (key, scale) in abs_scales {
-                    let item = multiscales.layout.iter().find(|item| item.asset == key);
-                    if let Some(item) = item {
-                        items.insert(scale, item.clone());
-                    }
-                }
-                layout_items = Some(items);
+            if base_spatial_shape.is_none() {
+                base_spatial_shape = Some(spatial_shape);
             }
+
+            let spatial_bbox = if let Some(spatial_bbox) = spatial_bbox {
+                spatial_bbox
+            } else {
+                let xmin = spatial_transform[2];
+                let xmax = (spatial_shape[1] as f64) * spatial_transform[0]
+                    + (spatial_shape[0] as f64) * spatial_transform[1]
+                    + spatial_transform[2];
+                let ymax = spatial_transform[5];
+                let ymin = (spatial_shape[1] as f64) * spatial_transform[3]
+                    + (spatial_shape[0] as f64) * spatial_transform[4]
+                    + spatial_transform[5];
+                [xmin, ymin, xmax, ymax]
+            };
+
+            let base_res = spatial_resolutions(&spatial_shape, &spatial_bbox);
+            let abs_scales = abs_scales(base_res, &multiscales, indices.as_slice());
+
+            let mut items = HashMap::new();
+            for (key, scale) in abs_scales {
+                let item = multiscales.layout.iter().find(|item| item.asset == key);
+                if let Some(item) = item {
+                    items.insert(scale, item.clone());
+                }
+            }
+            Some(items)
+        } else {
+            None
+        };
+
+        // get time coordinates
+        let mut time_arrays = HashMap::new();
+        if let Some(multiscales) = &multiscales {
+            for layout_item in &multiscales.layout {
+                let base_path = format!("/{}", layout_item.asset);
+                let path = format!("/{}/time", layout_item.asset);
+                let array = Array::async_open(Arc::clone(&zarr_store), path.as_str())
+                    .await
+                    .map_err(ZarrError::ArrayCreateError)?;
+                time_arrays.insert(base_path, Arc::new(array));
+            }
+        } else {
+            let array = Array::async_open(Arc::clone(&zarr_store), "/time")
+                .await
+                .map_err(ZarrError::ArrayCreateError)?;
+            time_arrays.insert("/".into(), Arc::new(array));
         }
+
+        let bounds = if let Some(spatial_bbox) = spatial_bbox {
+            let transformer =
+                proj::Proj::try_from((src_crs.clone().into_string().as_str(), "EPSG:4326"))
+                    .map_err(ZarrError::ProjCreateError)?;
+            let (x_min, y_min) = transformer
+                .convert((spatial_bbox[0], spatial_bbox[1]))
+                .map_err(ZarrError::ProjError)?;
+            let (x_max, y_max) = transformer
+                .convert((spatial_bbox[2], spatial_bbox[3]))
+                .map_err(ZarrError::ProjError)?;
+            let bounds = Bounds::new(x_min, y_min, x_max, y_max);
+            Some(bounds)
+        } else {
+            None
+        };
+
+        let tilejson = if let Some(bounds) = bounds {
+            tilejson! {
+                tiles: vec![],
+                minzoom: MIN_ZOOM,
+                maxzoom: MAX_ZOOM,
+                bounds: bounds
+            }
+        } else {
+            tilejson! {
+                tiles: vec![],
+                minzoom: MIN_ZOOM,
+                maxzoom: MAX_ZOOM,
+            }
+        };
 
         Ok(Self {
             id,
@@ -191,45 +243,27 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
             tileinfo,
             min_zoom: MIN_ZOOM,
             max_zoom: MAX_ZOOM,
-            time_coords,
+            time_arrays,
             data_vars: data_vars.into(),
-            src_crs,
-            src_transform,
-            src_shape,
+            spatial_transform,
+            spatial_shape: base_spatial_shape,
             spatial_registration,
             cache_zoom,
             warp_cache,
             layout_items,
+            nodes,
         })
     }
 
     /// Calculate warp grid
-    async fn run_calculate_warp_grid(&self, xyz: TileCoord) -> Result<Option<WarpGrid>, ZarrError> {
-        let src_crs = self.src_crs.clone();
-        let spatial_registration = self.spatial_registration.clone();
-
-        // find matching layout item if it is a multiscales geozarr
-        let matching_item = if let Some(layout_items) = &self.layout_items {
-            let target_res = tile_res(xyz.z);
-            let (_, layout_item) = layout_items
-                .iter()
-                .filter(|(scale_key, _)| **scale_key <= target_res)
-                .max_by_key(|(scale_key, _)| **scale_key)
-                .or_else(|| layout_items.iter().max_by_key(|(scale_key, _)| **scale_key))
-                .expect("at least one item should match");
-            Some(layout_item)
-        } else {
-            None
-        };
-
-        let src_transform = matching_item
-            .and_then(|item| item.spatial_transform)
-            .unwrap_or(self.src_transform);
-
-        let src_shape = matching_item
-            .and_then(|item| item.spatial_shape)
-            .unwrap_or(self.src_shape);
-
+    async fn run_calculate_warp_grid(
+        &self,
+        xyz: TileCoord,
+        src_crs: String,
+        src_transform: [f64; 6],
+        src_shape: [u64; 2],
+        spatial_registration: SpatialRegistration,
+    ) -> Result<Option<WarpGrid>, ZarrError> {
         run_on_rayon(move || {
             calculate_warp_grid(
                 xyz,
@@ -248,7 +282,7 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         warp_grid: Box<[i64]>,
         warp_grid_bbox: [u64; 4],
         tile_data: ndarray::Array3<f32>,
-        fill_value: f32,
+        fill_value: ZarrFillValue,
         min: f32,
         max: f32,
     ) -> Result<Vec<u8>, ZarrError> {
@@ -348,13 +382,7 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                         query_params.date_time = Some(date_time);
                     }
                     "data_var" => {
-                        let path_str = value.as_str();
-                        let formatted = if path_str.starts_with('/') {
-                            path_str.to_owned()
-                        } else {
-                            format!("/{path_str}")
-                        };
-                        query_params.data_var = Some(formatted);
+                        query_params.data_var = Some(value.as_str().into());
                     }
                     "min" => {
                         let val_f32 = value.parse().map_err(ZarrError::ParseFloatError)?;
@@ -378,18 +406,82 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                 query_params.max,
             )
         {
-            let data_var = self.data_vars.get(data_var_key).ok_or_else(|| {
+            // dynamically determine path to data array for multiscales zarr stores
+            let matching_item = find_layout_item(xyz, self.layout_items.as_ref());
+            let data_path = if let Some(layout_item) = matching_item {
+                // all asset paths are relative to the group containing the multiscales metadata
+                // current assumption is that multiscales is defined at the root group
+                let asset_path = layout_item.asset.as_str();
+                format!("/{asset_path}/{data_var_key}")
+            } else {
+                format!("/{data_var_key}")
+            };
+
+            let data_var = self.data_vars.get(&data_path).ok_or_else(|| {
                 ZarrError::ParameterError(format!(
-                    "Data variable {data_var_key} does not exist in Zarr store"
+                    "Data variable {data_path} does not exist in Zarr store"
                 ))
             })?;
-            let fill_value = fill_value_f32(data_var.fill_value())?;
+
+            let fill_value = fill_value(data_var.fill_value(), data_var.data_type())?;
+
+            // path to resolution level
+            let level_path = matching_item
+                .map(|item| format!("/{}", item.asset.clone()))
+                .unwrap_or("/".into());
+
+            let group_node = self
+                .nodes
+                .iter()
+                .find(|node| node.path().as_str() == level_path.as_str())
+                .expect("group node must be in hierarchy");
+
+            // CRS has to be defined either on array or group level
+            let src_crs = if let Some(proj) = get_proj(group_node) {
+                proj
+            } else {
+                // fallback to array node
+                let node = self
+                    .nodes
+                    .iter()
+                    .find(|node| node.path().as_str() == data_path)
+                    .expect("array node must be in hierarchy");
+                get_proj(node).expect("unable to parse projection data")
+            };
+
+            let spatial_transform = matching_item
+                .and_then(|item| item.spatial_transform)
+                .unwrap_or(self.spatial_transform);
+
+            let spatial_shape = matching_item
+                .and_then(|item| item.spatial_shape)
+                .or_else(|| {
+                    // fallback to array node
+                    let node = self
+                        .nodes
+                        .iter()
+                        .find(|node| node.path().as_str() == data_path)
+                        .expect("array node should be in hierarchy");
+                    get_spatial_shape(node).unwrap_or(None)
+                })
+                .or_else(|| self.spatial_shape)
+                .expect("spatial:shape to be present in hierarchy");
+
+            let spatial_registration = self.spatial_registration.clone();
 
             let warp_grid = self
                 .warp_cache
                 .cache
                 .get_with(WarpCacheKey(xyz, self.id.clone()), async {
-                    self.run_calculate_warp_grid(xyz).await.ok()?
+                    self.run_calculate_warp_grid(
+                        xyz,
+                        src_crs.into_string(),
+                        spatial_transform,
+                        spatial_shape,
+                        spatial_registration,
+                    )
+                    .await
+                    .ok()?
                 })
                 .await;
 
@@ -397,18 +489,20 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                 return Ok(vec![]);
             };
 
-            let tile_data = retrieve_tile_data(
-                warp_grid_bbox,
-                self.time_coords.clone(),
-                date_time,
-                data_var,
-            )
-            .await?;
+            let time_coords = self
+                .time_arrays
+                .get(&level_path)
+                .map(|coords| Arc::clone(coords));
+
+            let tile_data =
+                retrieve_tile_data(warp_grid_bbox, time_coords, date_time, data_var).await?;
+            info!("tile data: {tile_data:?}");
 
             let sampled_data = self
                 .run_sample_data(warp_grid, warp_grid_bbox, tile_data, fill_value, min, max)
                 .await
                 .map_err(MartinCoreError::ZarrError)?;
+            info!("sampled data: {sampled_data:?}");
 
             return Ok(sampled_data);
         }

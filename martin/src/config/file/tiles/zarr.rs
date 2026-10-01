@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_credential_types::provider::{ProvideCredentials as _, SharedCredentialsProvider};
+#[cfg(test)]
+use aws_runtime::env_config::file::EnvConfigFiles;
 use martin_config_macros::CollectUnrecognizedKeys;
 use martin_core::tiles::BoxedSource;
 use martin_core::tiles::zarr::cache::WarpCache;
@@ -155,6 +157,8 @@ impl ZarrConfig {
 
         #[cfg(test)]
         let loader = if let Some(files) = &self.aws_profile_files {
+            use aws_config::profile::ProfileFileRegionProvider;
+
             let region_provider = ProfileFileRegionProvider::builder()
                 .profile_name(profile)
                 .profile_files(files.clone())
