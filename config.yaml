@@ -38,7 +38,7 @@ observability:
     # Example: `{ env: prod, server: martin }`
     add_labels: {}
 
-
+# https://atlantis-vis-o.s3-ext.jc.rl.ac.uk/noc-npd-era5-demo/npd-eorca025-era5v1/gn/T1y_4d/thetao_con/zarr.json
 zarr:
   sources:
     pyramid: tests/fixtures/zarr/pyramid.zarr

@@ -65,6 +65,12 @@ impl Proj {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ResolutionLevel {
+    pub(crate) scale: f64,
+    pub(crate) item: LayoutItem,
+}
+
 pub(crate) const TILE_PIXELS: u32 = 512;
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
 
@@ -73,9 +79,36 @@ pub(crate) fn tile_len(zoom: u8) -> f64 {
     EARTH_CIRCUMFERENCE / f64::from(1_u32 << zoom)
 }
 
-/// Calculate spatial resolution per pixel
-pub(crate) fn tile_res(zoom: u8) -> u64 {
-    (tile_len(zoom).round() as u64) / (TILE_PIXELS as u64)
+/// Calculate tile resolution in source coordinate system
+pub(crate) fn native_tile_res(
+    tile: TileCoord,
+    target_crs: &str,
+    src_crs: &str,
+) -> Result<f64, ZarrError> {
+    let bbox = tile_bbox(tile.x, tile.y, tile.z);
+    let inv_trafo =
+        proj::Proj::try_from((target_crs, src_crs)).map_err(ZarrError::ProjCreateError)?;
+
+    let (x1, _) = inv_trafo
+        .convert((bbox[0], bbox[1]))
+        .map_err(ZarrError::ProjError)?; // bottom-left
+    let (x2, _) = inv_trafo
+        .convert((bbox[2], bbox[1]))
+        .map_err(ZarrError::ProjError)?; // bottom-right
+    let (x3, _) = inv_trafo
+        .convert((bbox[0], bbox[3]))
+        .map_err(ZarrError::ProjError)?; // top-left
+    let (x4, _) = inv_trafo
+        .convert((bbox[2], bbox[3]))
+        .map_err(ZarrError::ProjError)?; // top-right
+
+    let min_x = x1.min(x2).min(x3).min(x4);
+    let max_x = x1.max(x2).max(x3).max(x4);
+
+    let span_x = (max_x - min_x).abs();
+    let res_per_pixel = span_x / (TILE_PIXELS as f64);
+
+    Ok(res_per_pixel)
 }
 
 /// Calculates the spatial bounding box of a tile
@@ -144,15 +177,6 @@ pub(crate) async fn zarr_nodes<T: ObjectStore>(
     Ok(nodes)
 }
 
-/// Retrieve time array path from immediate children
-pub(crate) fn time_array_path(node: &Node) -> Option<NodePath> {
-    let child_nodes = node.children();
-    child_nodes
-        .into_iter()
-        .find(|n| n.name().as_str() == "time")
-        .map(|n| n.path().clone())
-}
-
 pub(crate) fn node_attributes(node: &Node) -> Map<String, Value> {
     match node.metadata() {
         NodeMetadata::Array(ArrayMetadata::V2(metadata)) => metadata.attributes.clone(),
@@ -199,20 +223,38 @@ pub(crate) fn get_spatial_dims_indices<T: AsRef<str>>(
     spatial_dims: &[T],
     dimension_names: &[DimensionName],
 ) -> Result<Vec<usize>, ZarrError> {
-    let mut result = Vec::new();
-    for spatial_dim in spatial_dims {
-        let val = dimension_names
-            .iter()
-            .position(|name| name.as_deref() == Some(spatial_dim.as_ref()))
-            .ok_or_else(|| {
-                ZarrError::DimensionError(format!(
-                    "Missing spatial dimension: {}",
-                    spatial_dim.as_ref()
-                ))
-            })?;
-        result.push(val);
-    }
+    spatial_dims
+        .iter()
+        .map(|spatial_dim| {
+            let dim_str = spatial_dim.as_ref();
+            dimension_names
+                .iter()
+                .position(|name| name.as_deref() == Some(dim_str))
+                .ok_or_else(|| {
+                    ZarrError::DimensionError(format!("Missing spatial dimension: {dim_str}"))
+                })
+        })
+        .collect()
+}
 
+/// Retrieve the index of the temporal dimension - assumed to be "time"
+pub(crate) fn get_temporal_dim_index(dimension_names: &[DimensionName]) -> Option<usize> {
+    dimension_names
+        .iter()
+        .position(|dim| dim.as_deref().is_some_and(|name| name == "time"))
+}
+
+/// Retrieve canonical permutation of indices in the form of time, y and x
+pub(crate) fn get_dims_indices<T: AsRef<str>>(
+    spatial_dims: &[T],
+    dimension_names: &[DimensionName],
+) -> Result<Vec<usize>, ZarrError> {
+    let mut result = Vec::new();
+    if let Some(temporal_dim_index) = get_temporal_dim_index(dimension_names) {
+        result.push(temporal_dim_index);
+    }
+    let spatial_dims_indices = get_spatial_dims_indices(spatial_dims, dimension_names)?;
+    result.extend(spatial_dims_indices);
     Ok(result)
 }
 
@@ -304,7 +346,7 @@ fn insert_scales(
     key: &str,
     scale: &[f64],
     multiscales: &Multiscales,
-    scales: &mut HashMap<String, u64>,
+    scales: &mut HashMap<String, f64>,
     indices: &[usize],
 ) {
     let curr_levels = multiscales
@@ -321,14 +363,7 @@ fn insert_scales(
                     scale[0] * current_scale[indices[0]],
                     scale[1] * current_scale[indices[1]],
                 ];
-                scales.insert(
-                    current_key.into(),
-                    new_scale
-                        .iter()
-                        .map(|val| val.ceil() as u64)
-                        .max()
-                        .expect("should have a maxmimum value"),
-                );
+                scales.insert(current_key.into(), new_scale[0].max(new_scale[1]));
                 insert_scales(current_key, &new_scale[..], multiscales, scales, indices);
             }
         }
@@ -340,27 +375,23 @@ pub(crate) fn abs_scales(
     base_res: [f64; 2],
     multiscales: &Multiscales,
     indices: &[usize],
-) -> HashMap<String, u64> {
+) -> HashMap<String, f64> {
     let mut scales = HashMap::with_capacity(multiscales.layout.len());
+
     let root_key = multiscales
         .layout
         .iter()
         .find(|item| item.derived_from.is_none())
-        .map_or(String::new(), |root| root.asset.clone());
-    let root_scale = base_res;
+        .map_or_else(String::new, |root| root.asset.clone());
 
-    scales.insert(
-        root_key.clone(),
-        root_scale
-            .iter()
-            .map(|val| val.ceil() as u64)
-            .max()
-            .expect("should have a maximum value"),
-    );
+    let root_scale_max = base_res[0].max(base_res[1]);
+
+    scales.insert(root_key.clone(), root_scale_max);
+
     insert_scales(
         root_key.as_str(),
-        &root_scale[..],
-        &multiscales,
+        &base_res[..],
+        multiscales,
         &mut scales,
         indices,
     );
@@ -368,26 +399,35 @@ pub(crate) fn abs_scales(
     scales
 }
 
-/// Find matching layout item for given tile
-pub(crate) fn find_layout_item(
+/// Find matching layout item for a given tile
+pub(crate) fn select_best_level<'a>(
     xyz: TileCoord,
-    layout_items: Option<&HashMap<u64, LayoutItem>>,
-) -> Option<&LayoutItem> {
-    if let Some(layout_items) = layout_items {
-        let target_res = tile_res(xyz.z);
-        let (_, layout_item) = layout_items
+    levels: Option<&'a [ResolutionLevel]>,
+    target_crs: &str,
+    src_crs: &str,
+) -> Result<Option<&'a LayoutItem>, ZarrError> {
+    if let Some(levels) = levels {
+        if levels.is_empty() {
+            return Ok(None);
+        }
+
+        let target_res = native_tile_res(xyz, target_crs, src_crs)?;
+        Ok(levels
             .iter()
-            .filter(|(scale_key, _)| **scale_key <= target_res)
-            .max_by_key(|(scale_key, _)| **scale_key)
-            .or_else(|| layout_items.iter().max_by_key(|(scale_key, _)| **scale_key))
-            .expect("at least one item should match");
-        Some(layout_item)
+            .min_by(|a, b| {
+                let diff_a = (a.scale - target_res).abs();
+                let diff_b = (b.scale - target_res).abs();
+                diff_a
+                    .partial_cmp(&diff_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|lvl| &lvl.item))
     } else {
-        None
+        return Ok(None);
     }
 }
 
-/// Convert fill value to f32
+/// Convert fill value to `f32``
 pub(crate) fn fill_value_f32(fill_value: &FillValue) -> Result<f32, ZarrError> {
     let bytes: [u8; 4] = fill_value
         .as_ne_bytes()
@@ -397,7 +437,7 @@ pub(crate) fn fill_value_f32(fill_value: &FillValue) -> Result<f32, ZarrError> {
     Ok(f32::from_ne_bytes(bytes))
 }
 
-/// Convert fill value to f64
+/// Convert fill value to `f64`
 pub(crate) fn fill_value_f64(fill_value: &FillValue) -> Result<f64, ZarrError> {
     let bytes: [u8; 8] = fill_value
         .as_ne_bytes()
@@ -427,24 +467,39 @@ pub(crate) fn fill_value(
     }
 }
 
+/// Helper function to permute ranges
+fn permute_ranges(
+    dims_indices: &[usize],
+    time: Option<&Range<u64>>,
+    y: Range<u64>,
+    x: Range<u64>,
+) -> Vec<Range<u64>> {
+    let max_idx = dims_indices.iter().copied().max().unwrap_or(0);
+    let mut result = vec![0..1; max_idx + 1];
+
+    if let Some(time_range) = time {
+        result[dims_indices[0]] = time_range.clone();
+    }
+    result[dims_indices[1]] = y;
+    result[dims_indices[2]] = x;
+
+    result
+}
+
 /// Retrieve tile data from array
 pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
     warp_grid_bbox: [u64; 4],
-    time_coords: Option<Arc<Array<AsyncObjectStore<T>>>>,
+    temporal_index: Option<&TemporalIndex>,
     datetime: DateTime<Utc>,
     data_var: &Array<AsyncObjectStore<T>>,
+    dims_indices: &[usize],
 ) -> Result<ndarray::Array3<f32>, ZarrError> {
     // get time index
     let mut time_range = None;
-    if let Some(arr) = time_coords {
-        let temporal_index = TimeMetadata::get_temporal_index(&arr, datetime).await?;
+    if let Some(temporal_index) = temporal_index {
+        let temporal_index = temporal_index.get_index(&datetime)?;
         time_range = Some(temporal_index..temporal_index + 1);
     }
-
-    let dimension_names = data_var
-        .dimension_names()
-        .as_deref()
-        .ok_or(ZarrError::DimensionError("Missing dimension names".into()))?;
 
     let x_end = warp_grid_bbox[2]
         .checked_add(1)
@@ -455,7 +510,7 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
     let x_range = warp_grid_bbox[0]..x_end;
     let y_range = warp_grid_bbox[1]..y_end;
 
-    let ranges = build_ranges(dimension_names, time_range.as_ref(), y_range, x_range)?;
+    let ranges = permute_ranges(dims_indices, time_range.as_ref(), y_range, x_range);
 
     let tile_data = match ranges.len() {
         3 => match data_var.data_type().name(ZarrVersion::V3).as_deref() {
@@ -465,7 +520,7 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
                     .await
                     .map_err(ZarrError::ArrayError)?;
 
-                data
+                data.permuted_axes([dims_indices[0], dims_indices[1], dims_indices[2]])
             }
             Some("float64") => {
                 let data = data_var
@@ -474,7 +529,7 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
                     .map_err(ZarrError::ArrayError)?
                     .mapv(|val| val as f32);
 
-                data
+                data.permuted_axes([dims_indices[0], dims_indices[1], dims_indices[2]])
             }
             _ => return Err(ZarrError::CastError("Unimplemented data type".into())),
         },
@@ -486,7 +541,8 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
                     .await
                     .map_err(ZarrError::ArrayError)?;
 
-                data.insert_axis(ndarray::Axis(0))
+                let data = data.insert_axis(ndarray::Axis(0));
+                data.permuted_axes([0, dims_indices[0], dims_indices[1]])
             }
             Some("float64") => {
                 let data = data_var
@@ -495,7 +551,8 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore>(
                     .map_err(ZarrError::ArrayError)?
                     .mapv(|val| val as f32);
 
-                data.insert_axis(ndarray::Axis(0))
+                let data = data.insert_axis(ndarray::Axis(0));
+                data.permuted_axes([0, dims_indices[0], dims_indices[1]])
             }
             _ => return Err(ZarrError::CastError("Unimplemented data type".into())),
         },
@@ -521,7 +578,7 @@ pub(crate) fn sample_data(
     max: f32,
 ) -> Result<Vec<u8>, ZarrError> {
     // sample from array at warp grid points
-    let (sampled_data, _min, _max) = sample_warp_grid(
+    let (sampled_data, _min, _max) = sample_at_warp_grid(
         warp_grid,
         warp_grid_bbox,
         tile_data,
@@ -546,65 +603,7 @@ pub(crate) fn sample_data(
     )
 }
 
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::cast_possible_truncation)]
-fn sampled_data_to_png(
-    sampled_data: &[f32],
-    width: u32,
-    height: u32,
-    min: f32,
-    max: f32,
-    fill_value: ZarrFillValue,
-) -> Result<Vec<u8>, ZarrError> {
-    if sampled_data.len() != (width * height) as usize {
-        return Err(ZarrError::DimensionError(format!(
-            "Buffer size {} does not match dimensions {}x{}",
-            sampled_data.len(),
-            width,
-            height
-        )));
-    }
-
-    let mut image = GrayAlphaImage::new(width, height);
-
-    let range = if (max - min).abs() < f32::EPSILON {
-        1.0
-    } else {
-        max - min
-    };
-
-    for (i, &value) in sampled_data.iter().enumerate() {
-        let is_nodata = match fill_value {
-            ZarrFillValue::F32(fill_value) => {
-                value.is_nan() || fill_value.is_nan() || (value - fill_value).abs() < f32::EPSILON
-            }
-        };
-
-        let pixel = if is_nodata {
-            [0, 0] // Transparent (Luma=0, Alpha=0)
-        } else {
-            let normalized = ((value - min) / range).clamp(0.0, 1.0);
-            let v = (normalized * 255.0).round() as u8;
-
-            [v, 255] // Opaque Grayscale (Luma=v, Alpha=255)
-        };
-
-        let x = (i as u32) % width;
-        let y = (i as u32) / width;
-
-        image.put_pixel(x, y, LumaA(pixel));
-    }
-
-    let mut bytes = Cursor::new(Vec::new());
-
-    image
-        .write_to(&mut bytes, ImageFormat::Png)
-        .map_err(ZarrError::ImageError)?;
-
-    Ok(bytes.into_inner())
-}
-
-fn sample_warp_grid(
+fn sample_at_warp_grid(
     warp_grid: &[i64],
     warp_grid_bbox: [u64; 4],
     tile_data: &ndarray::Array3<f32>,
@@ -652,6 +651,65 @@ fn sample_warp_grid(
     }
 
     Ok((sampled_data, min, max))
+}
+
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation)]
+fn sampled_data_to_png(
+    sampled_data: &[f32],
+    width: u32,
+    height: u32,
+    min: f32,
+    max: f32,
+    fill_value: ZarrFillValue,
+) -> Result<Vec<u8>, ZarrError> {
+    let expected_len = (width * height) as usize;
+    if sampled_data.len() != expected_len {
+        return Err(ZarrError::DimensionError(format!(
+            "Buffer size {} does not match dimensions {}x{}",
+            sampled_data.len(),
+            width,
+            height
+        )));
+    }
+
+    let mut image = GrayAlphaImage::new(width, height);
+
+    let range = if max > min { max - min } else { 1.0 };
+
+    let target_fill = match fill_value {
+        ZarrFillValue::F32(v) => v,
+    };
+
+    for (i, &value) in sampled_data.iter().enumerate() {
+        let is_nodata = value.is_nan()
+            || (target_fill.is_nan() && value.is_nan())
+            || (!target_fill.is_nan()
+                && (value - target_fill).abs() <= f32::EPSILON * target_fill.abs().max(1.0));
+
+        let pixel = if is_nodata {
+            [0, 0]
+        } else {
+            // Normalize against min/max bounds
+            let normalized = ((value - min) / range).clamp(0.0, 1.0);
+            let v = (normalized * 255.0).round() as u8;
+
+            [v, 255]
+        };
+
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+
+        image.put_pixel(x, y, LumaA(pixel));
+    }
+
+    let mut bytes = Cursor::new(Vec::new());
+
+    image
+        .write_to(&mut bytes, ImageFormat::Png)
+        .map_err(ZarrError::ImageError)?;
+
+    Ok(bytes.into_inner())
 }
 
 pub(crate) type WarpGrid = (Box<[i64]>, [u64; 4]);
@@ -815,88 +873,26 @@ fn inverse_affine(transform: [f64; 6]) -> [f64; 6] {
     ]
 }
 
-/// Helper function for ranges used in fetching the data
-fn build_ranges(
-    dimension_names: &[DimensionName],
-    time: Option<&Range<u64>>,
-    y: Range<u64>,
-    x: Range<u64>,
-) -> Result<Vec<Range<u64>>, ZarrError> {
-    dimension_names
-        .iter()
-        .map(|name| match name.as_deref() {
-            Some("time") => time
-                .cloned()
-                .ok_or_else(|| ZarrError::TimeError("Missing time array indices".into())),
-            Some("y") => Ok(y.clone()),
-            Some("x") => Ok(x.clone()),
-            Some("lat") => Ok(y.clone()),
-            Some("lon") => Ok(x.clone()),
-            _ => Err(ZarrError::DimensionError(format!(
-                "Unknown dimension: {name:?}"
-            ))),
-        })
-        .collect()
-}
-
 /// Metadata for temporal units and epoch
-#[derive(Debug)]
-struct TimeMetadata {
-    units: String,
-    epoch: DateTime<Utc>,
-    _calendar: String,
+#[derive(Debug, Clone)]
+pub(crate) struct TimeMetadata {
+    pub(crate) units: String,
+    pub(crate) epoch: DateTime<Utc>,
+    #[allow(dead_code)]
+    pub(crate) calendar: String,
 }
 
-impl TimeMetadata {
-    fn parse_zarr_time_attrs(units: &str, calendar: &str) -> Result<Self, ZarrError> {
-        // split "seconds since 1970-01-01"
-        let parts: Vec<&str> = units.split(" since ").collect();
-        let unit_type = parts[0].to_lowercase();
+#[derive(Debug, Clone)]
+pub(crate) struct TemporalIndex {
+    /// In-memory sorted array of timestamps
+    pub(crate) time_values: Vec<f64>,
+    pub(crate) time_meta: TimeMetadata,
+}
 
-        // parse the date part
-        let epoch_date =
-            NaiveDate::parse_from_str(parts[1].split(' ').collect::<Vec<_>>()[0], "%Y-%m-%d")
-                .map_err(ZarrError::ParseError)?;
-
-        // convert to UTC DateTime at midnight
-        let epoch_date_time = epoch_date.and_hms_opt(0, 0, 0).ok_or(ZarrError::TimeError(
-            "Can not convert to date time value".into(),
-        ))?;
-        let epoch = Utc.from_utc_datetime(&epoch_date_time);
-
-        Ok(Self {
-            units: unit_type,
-            epoch,
-            _calendar: calendar.to_owned(),
-        })
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    fn datetime_to_raw(&self, val: &DateTime<Utc>) -> f64 {
-        let duration = val.signed_duration_since(self.epoch);
-        let secs = duration.num_seconds();
-        let nanos = i64::from(duration.subsec_nanos());
-
-        let total_seconds = secs + (nanos / 1_000_000_000);
-
-        let scale = match self.units.as_str() {
-            "days" => 1.0 / 86400.0,
-            "hours" => 1.0 / 3600.0,
-            "minutes" => 1.0 / 60.0,
-            "milliseconds" => 1000.0,
-            "microseconds" => 1_000_000.0,
-            _ => 1.0, // "seconds"
-        };
-
-        total_seconds as f64 * scale
-    }
-
-    // TODO: parsing
-    async fn get_temporal_index<T: ObjectStore>(
+impl TemporalIndex {
+    pub async fn load<T: ObjectStore>(
         time_coords: &Array<AsyncObjectStore<T>>,
-        datetime: DateTime<Utc>,
-    ) -> Result<u64, ZarrError> {
-        // Load time data
+    ) -> Result<Self, ZarrError> {
         let data_type = time_coords.data_type();
         let name = data_type.name(ZarrVersion::V3);
 
@@ -923,62 +919,107 @@ impl TimeMetadata {
             _ => return Err(ZarrError::DimensionError("Data type not supported".into())),
         };
 
-        let units = time_coords.attributes().get("units").and_then(|v| {
-            if v.is_string() {
-                return v.as_str();
-            }
-            None
-        });
+        // Extract metadata
+        let attrs = time_coords.attributes();
+        let units = attrs
+            .get("units")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ZarrError::TimeError("Could not get time units".into()))?;
 
-        let calendar = time_coords.attributes().get("calendar").and_then(|v| {
-            if v.is_string() {
-                return v.as_str();
-            }
-            None
-        });
+        let calendar = attrs
+            .get("calendar")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ZarrError::TimeError("Could not get calendar metadata".into()))?;
 
-        let units = units.ok_or(ZarrError::TimeError("Could not get time units".into()))?;
-        let calendar = calendar.ok_or(ZarrError::TimeError(
-            "Could not get calendar metadata".into(),
-        ))?;
-        let time_meta = Self::parse_zarr_time_attrs(units, calendar)?;
-        let val = time_meta.datetime_to_raw(&datetime);
-        let index = find_closest_binary(&data_time, val)? as u64;
+        let time_meta = TimeMetadata::parse_zarr_time_attrs(units, calendar)?;
+        let (time_values, _offset) = data_time.into_raw_vec_and_offset();
 
+        Ok(Self {
+            time_values,
+            time_meta,
+        })
+    }
+
+    /// Get index of datetime along temporal dimension
+    pub fn get_index(&self, datetime: &DateTime<Utc>) -> Result<u64, ZarrError> {
+        let val = self.time_meta.datetime_to_raw(datetime);
+        let index = self.find_closest_binary(val)? as u64;
         Ok(index)
+    }
+
+    /// Binary search helper function
+    fn find_closest_binary(&self, target: f64) -> Result<usize, ZarrError> {
+        let time_array = &self.time_values;
+        match time_array.binary_search_by(|probe| {
+            probe
+                .partial_cmp(&target)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            Ok(index) => Ok(index),
+            Err(index) => {
+                // 'index' is the insertion point
+                if index == 0 {
+                    return Ok(0);
+                }
+                if index >= time_array.len() {
+                    return Ok(time_array.len() - 1);
+                }
+
+                let diff_left = (target - time_array[index - 1]).abs();
+                let diff_right = (time_array[index] - target).abs();
+
+                if diff_left < diff_right {
+                    Ok(index - 1)
+                } else {
+                    Ok(index)
+                }
+            }
+        }
     }
 }
 
-/// Binary search helper function
-fn find_closest_binary(time_array: &ndarray::Array1<f64>, target: f64) -> Result<usize, ZarrError> {
-    let slice = time_array
-        .as_slice()
-        .ok_or(ZarrError::TimeError("Could not convert to slice".into()))?;
+impl TimeMetadata {
+    fn parse_zarr_time_attrs(units: &str, calendar: &str) -> Result<Self, ZarrError> {
+        // split "seconds since 1970-01-01"
+        let parts: Vec<&str> = units.split(" since ").collect();
+        let unit_type = parts[0].to_lowercase();
 
-    match slice.binary_search_by(|probe| {
-        probe
-            .partial_cmp(&target)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }) {
-        Ok(index) => Ok(index),
-        Err(index) => {
-            // 'index' is the insertion point
-            if index == 0 {
-                return Ok(0);
-            }
-            if index >= slice.len() {
-                return Ok(slice.len() - 1);
-            }
+        // parse the date part
+        let epoch_date =
+            NaiveDate::parse_from_str(parts[1].split(' ').collect::<Vec<_>>()[0], "%Y-%m-%d")
+                .map_err(ZarrError::ParseError)?;
 
-            let diff_left = (target - slice[index - 1]).abs();
-            let diff_right = (slice[index] - target).abs();
+        // convert to UTC DateTime at midnight
+        let epoch_date_time = epoch_date.and_hms_opt(0, 0, 0).ok_or(ZarrError::TimeError(
+            "Can not convert to date time value".into(),
+        ))?;
+        let epoch = Utc.from_utc_datetime(&epoch_date_time);
 
-            if diff_left < diff_right {
-                Ok(index - 1)
-            } else {
-                Ok(index)
-            }
-        }
+        Ok(Self {
+            units: unit_type,
+            epoch,
+            calendar: calendar.to_owned(),
+        })
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn datetime_to_raw(&self, val: &DateTime<Utc>) -> f64 {
+        let duration = val.signed_duration_since(self.epoch);
+        let secs = duration.num_seconds();
+        let nanos = i64::from(duration.subsec_nanos());
+
+        let total_seconds = secs + (nanos / 1_000_000_000);
+
+        let scale = match self.units.as_str() {
+            "days" => 1.0 / 86400.0,
+            "hours" => 1.0 / 3600.0,
+            "minutes" => 1.0 / 60.0,
+            "milliseconds" => 1000.0,
+            "microseconds" => 1_000_000.0,
+            _ => 1.0, // "seconds"
+        };
+
+        total_seconds as f64 * scale
     }
 }
 
@@ -1066,6 +1107,11 @@ mod tests {
         let indices = get_spatial_dims_indices(spatial_dims.as_slice(), dimension_names)
             .expect("should have indices");
         assert_eq!(indices, vec![1, 2]);
+        let temporal_index = get_temporal_dim_index(dimension_names).expect("should have indices");
+        assert_eq!(temporal_index, 0);
+        let dims_indices =
+            get_dims_indices(&spatial_dims, dimension_names).expect("should return indices");
+        assert_eq!(dims_indices, vec![0, 1, 2]);
     }
 
     #[tokio::test]
@@ -1091,7 +1137,7 @@ mod tests {
             .expect("should have multiscales");
         let scales = abs_scales([1.0, 1.0], &multiscales, &indices[..]);
         let first = scales.get("1");
-        assert_eq!(first, Some(&2));
+        assert_eq!(first, Some(&2.5));
     }
 
     #[test]
@@ -1192,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sample_warp_grid() {
+    fn test_sample_at_warp_grid() {
         let mut data = ndarray::Array3::<f32>::zeros((1, 4, 4));
 
         for y in 0..3 {
@@ -1213,7 +1259,7 @@ mod tests {
         .expect("could not calculate warp grid")
         .expect("should be some");
 
-        let (sampled_data, min, max) = sample_warp_grid(
+        let (sampled_data, min, max) = sample_at_warp_grid(
             &warp_grid,
             warp_grid_bbox,
             &data,
@@ -1269,20 +1315,17 @@ mod tests {
             .expect("should have root group");
 
         // time
-        let first_node = Node::async_open(Arc::clone(&store), "/0")
-            .await
-            .expect("should have at least one group");
         let time_str = "2026-08-13T00:04:00.000Z";
         let datetime = DateTime::parse_from_rfc3339(time_str)
             .expect("msg")
             .with_timezone(&Utc);
-        let time_path = time_array_path(&first_node).expect("should have time");
-        let time_array = Some(Arc::new(
-            Array::async_open(Arc::clone(&store), time_path.as_str())
+        let time_array = Arc::new(
+            Array::async_open(Arc::clone(&store), "/0/time")
                 .await
                 .map_err(ZarrError::ArrayCreateError)
                 .expect("should open"),
-        ));
+        );
+        let temporal_index = TemporalIndex::load(&time_array).await.expect("should load");
 
         let src_transform = get_spatial_transform(&root_node)
             .expect("could not get spatial:transform")
@@ -1300,9 +1343,15 @@ mod tests {
         )
         .expect("could not calculate warp grid")
         .expect("should be some");
-        let tile_data = retrieve_tile_data(warp_grid_bbox, time_array.clone(), datetime, &data_var)
-            .await
-            .expect("could not retrieve tile data");
+        let tile_data = retrieve_tile_data(
+            warp_grid_bbox,
+            Some(&temporal_index),
+            datetime,
+            &data_var,
+            &[0, 1, 2],
+        )
+        .await
+        .expect("could not retrieve tile data");
         let res = sample_data(
             &warp_grid,
             warp_grid_bbox,
