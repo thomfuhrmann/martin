@@ -225,6 +225,7 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         };
 
         // get time coordinates
+        // TODO: extend to any non-spatial dimension
         let mut temporal_indices = HashMap::new();
         if let Some(multiscales) = &multiscales {
             for layout_item in &multiscales.layout {

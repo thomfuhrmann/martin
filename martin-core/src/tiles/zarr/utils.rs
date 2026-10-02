@@ -237,6 +237,19 @@ pub(crate) fn get_spatial_dims_indices<T: AsRef<str>>(
         .collect()
 }
 
+/// Get the names of non-spatial dimensions
+pub(crate) fn get_non_spatial_dims<T: AsRef<str>>(
+    spatial_dims: &[T],
+    dimension_names: &[DimensionName],
+) -> Vec<String> {
+    dimension_names
+        .iter()
+        .filter_map(|dim| dim.as_deref())
+        .filter(|name| !spatial_dims.iter().any(|s| s.as_ref() == *name))
+        .map(String::from)
+        .collect()
+}
+
 /// Retrieve the index of the temporal dimension - assumed to be "time"
 pub(crate) fn get_temporal_dim_index(dimension_names: &[DimensionName]) -> Option<usize> {
     dimension_names
