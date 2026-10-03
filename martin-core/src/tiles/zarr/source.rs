@@ -1,13 +1,16 @@
 //! Source for `GeoZarr` data
 //!
-//! It is supposed that the metadata includes at least the following `GeoZarr` conventions:
+//! It is supposed that the `GeoZarr` metadata is conformant to at least the following conventions:
 //!
 //! - [proj](https://github.com/zarr-conventions/proj)
 //! - [spatial](https://github.com/zarr-conventions/spatial)
 //!
-//! [multiscales](https://github.com/zarr-conventions/multiscales) is optional
+//! The following conventions are optional:
 //!
-//! Currently all values are converted to `f32` and the data is delivered as a gray-scale PNG
+//! - [multiscales](https://github.com/zarr-conventions/multiscales) is optional
+//!
+//! Currently all values are converted to `f32` and the data is delivered as a single-band gray-scale PNG with values renormalized to 0-255
+//! If a mutliscales `GeoZarr` is provided, the appropriate resolution level is selected based on the tile zoom level.
 //!
 //! Client side tile requests have to include the following query parameters:
 //!
@@ -16,7 +19,10 @@
 //! - min: the min value of the data values to be rendered, for instance "5.0"
 //! - max: the max value of the data values to be rendered, for instance "10.0"
 //!
-//! Tile data is sample based on a (per tile-coord cached) warp grid which determines the relation between tile and source pixels
+//! The number of provided dimensional parameters has to be 2 less than the number of array dimensions, such that only spatial dimensions remain variable while all other dimensions are fixed to a single coordinate.
+//!
+//! Tile data is sample based on a (per tile-coord and -source cached) warp grid which determines the relation between tile and source pixels.
+//! The values are renormalized based on the provided min and max parameters.
 
 use core::fmt;
 use std::collections::HashMap;
