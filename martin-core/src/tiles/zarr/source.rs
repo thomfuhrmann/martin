@@ -1,6 +1,6 @@
-//! Source for GeoZarr data
+//! Source for `GeoZarr` data
 //!
-//! It is supposed that the metadata includes at least the following GeoZarr conventions:
+//! It is supposed that the metadata includes at least the following `GeoZarr` conventions:
 //!
 //! - [proj](https://github.com/zarr-conventions/proj)
 //! - [spatial](https://github.com/zarr-conventions/spatial)
@@ -11,10 +11,10 @@
 //!
 //! Client side tile requests have to include the following query parameters:
 //!
-//! - date: in the form "YYYY-MM-DDTHH:MM:SS.MMMZ", for example "2026-08-13T00:04:00.000Z",
-//! - data_var: the name of the Zarr variable to be rendered, for example "liquid_water"
-//! - min: the min value of the data values to be rendered, for example "5.0"
-//! - max: the max value of the data values to be rendered, for example "10.0"
+//! - dim:*=value: the name of the dimension and its value to be sliced, time has to be in the form "YYYY-MM-DDTHH:MM:SS.MMMZ", for instance `dim:time=2026-08-13T00:04:00.000Z`,
+//! - `data_var`: the name of the Zarr variable to be rendered, for instance `data_var=liquid_water`
+//! - min: the min value of the data values to be rendered, for instance "5.0"
+//! - max: the max value of the data values to be rendered, for instance "10.0"
 //!
 //! Tile data is sample based on a (per tile-coord cached) warp grid which determines the relation between tile and source pixels
 
@@ -27,10 +27,11 @@ use std::vec;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use martin_tile_utils::{Format, TileCoord, TileData, TileInfo};
+use ndarray::Array2;
 use object_store::ObjectStore;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::LazyLock;
-use tilejson::{Bounds, TileJSON, tilejson};
+use tilejson::{TileJSON, tilejson};
 use tokio::sync::oneshot;
 use tracing::info;
 use zarrs::array::Array;
@@ -41,11 +42,11 @@ use crate::CacheZoomRange;
 use crate::tiles::zarr::cache::{WarpCache, WarpCacheKey};
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::utils::{
-    Proj, ResolutionLevel, TILE_PIXELS, TemporalIndex, WarpGrid, ZarrFillValue, abs_scales,
-    calculate_warp_grid, fill_value, get_bbox, get_dims_indices, get_multiscales, get_proj,
-    get_spatial_dims, get_spatial_dims_indices, get_spatial_registration, get_spatial_shape,
-    get_spatial_transform, is_data_variable, retrieve_tile_data, sample_data, select_best_level,
-    spatial_resolutions, zarr_nodes,
+    DimIndex, DimMeta, Proj, ResolutionLevel, SpatialAxisIndices, TILE_PIXELS, WarpGrid,
+    ZarrFillValue, bounds_from_bbox, calculate_resolution_levels, calculate_warp_grid, fill_value,
+    get_bbox, get_multiscales, get_non_spatial_dims, get_proj, get_spatial_dims,
+    get_spatial_registration, get_spatial_shape, get_spatial_transform, is_data_variable,
+    retrieve_tile_data, sample_data, select_best_level, zarr_nodes,
 };
 use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
 
@@ -71,8 +72,9 @@ pub struct ZarrSource<T: ObjectStore + Clone> {
     min_zoom: u8,
     max_zoom: u8,
     src_crs: String,
-    temporal_indices: Arc<HashMap<String, TemporalIndex>>,
+    dims_index: Arc<HashMap<String, DimIndex>>,
     data_vars: Arc<HashMap<String, Array<AsyncObjectStore<T>>>>,
+    spatial_dims: Vec<String>,
     spatial_transform: [f64; 6],
     spatial_shape: Option<[u64; 2]>,
     spatial_registration: SpatialRegistration,
@@ -80,7 +82,6 @@ pub struct ZarrSource<T: ObjectStore + Clone> {
     warp_cache: WarpCache,
     resolution_levels: Option<Vec<ResolutionLevel>>,
     nodes: Vec<Node>,
-    dims_indices: Vec<usize>,
 }
 
 impl<T: ObjectStore + Clone> Debug for ZarrSource<T> {
@@ -108,13 +109,13 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         // get spatial metadata
         let root_node = Node::async_open(Arc::clone(&zarr_store), "/")
             .await
-            .map_err(|e| ZarrError::NodeCreateError(e))?;
+            .map_err(ZarrError::NodeCreateError)?;
         let src_crs = get_proj(&root_node).unwrap_or(Proj::Code("EPSG:4326".into()));
         let spatial_transform =
             get_spatial_transform(&root_node)?.unwrap_or([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
         let spatial_bbox = get_bbox(&root_node)?;
         let spatial_registration =
-            get_spatial_registration(&root_node)?.unwrap_or(SpatialRegistration::Pixel);
+            get_spatial_registration(&root_node).unwrap_or(SpatialRegistration::Pixel);
         let mut spatial_dims = get_spatial_dims(&root_node)?;
         let multiscales = get_multiscales(&root_node)?;
 
@@ -122,7 +123,6 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         let mut data_vars: HashMap<String, _> = HashMap::new();
         let nodes = zarr_nodes(Arc::clone(&zarr_store)).await?;
         let mut dimension_names = None;
-        let mut dims_indices = None;
         let mut first = true;
         for node in &nodes {
             if is_data_variable(node).is_ok_and(|val| val) {
@@ -131,21 +131,15 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
                     .map_err(ZarrError::ArrayCreateError)?;
                 if first {
                     // assuming that the dimension names are the same for all arrays of this store
-                    dimension_names = array.dimension_names().clone();
+                    dimension_names.clone_from(array.dimension_names());
                     if spatial_dims.is_none() {
-                        spatial_dims = get_spatial_dims(&node)?
-                    };
-
-                    if let Some(spatial_dims) = &spatial_dims
-                        && let Some(dimension_names) = &dimension_names
-                    {
-                        dims_indices = Some(get_dims_indices(&spatial_dims, &dimension_names)?);
+                        spatial_dims = get_spatial_dims(node)?;
                     }
 
                     first = false;
                 }
                 data_vars.insert(node.path().as_str().into(), array);
-            };
+            }
         }
 
         // get the base layout for multiscales
@@ -157,110 +151,56 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
                 .cloned()
         });
 
-        let mut base_spatial_shape = get_spatial_shape(&root_node)?;
-
         // calculate absolute scales and corresponding layout items for multiscales
-        let resolution_levels = if let Some(multiscales) = &multiscales
-            && let Some(base_layout) = base_layout
-            && let Some(dimension_names) = dimension_names
-            && let Some(spatial_dims) = spatial_dims
-        {
-            let indices = get_spatial_dims_indices(spatial_dims.as_slice(), &dimension_names)?;
-            let spatial_shape = if let Some(spatial_shape) = &base_layout.spatial_shape {
-                [spatial_shape[0], spatial_shape[1]]
-            } else {
-                // get spatial shape from array
-                let base_path = base_layout.asset;
-                let (_, arr) = data_vars
-                    .iter()
-                    .find(|(path, _)| path.starts_with(&base_path))
-                    .expect("should be at least one variable at base resolution level");
-                let shape = arr.shape();
-                let spatial_shape = indices.iter().map(|&idx| shape[idx]).collect::<Vec<_>>();
-                [spatial_shape[0], spatial_shape[1]]
-            };
+        let resolutions_and_shape = calculate_resolution_levels(
+            &data_vars,
+            multiscales.as_ref(),
+            base_layout.as_ref(),
+            dimension_names.as_deref(),
+            spatial_dims.as_deref(),
+            spatial_transform,
+            spatial_bbox,
+        )?;
 
-            if base_spatial_shape.is_none() {
-                base_spatial_shape = Some(spatial_shape);
-            }
+        let base_spatial_shape = if let Some((_, spatial_shape)) = resolutions_and_shape {
+            Some(spatial_shape)
+        } else {
+            get_spatial_shape(&root_node)?
+        };
 
-            let spatial_bbox = if let Some(spatial_bbox) = spatial_bbox {
-                spatial_bbox
-            } else {
-                let xmin = spatial_transform[2];
-                let xmax = (spatial_shape[1] as f64) * spatial_transform[0]
-                    + (spatial_shape[0] as f64) * spatial_transform[1]
-                    + spatial_transform[2];
-                let ymax = spatial_transform[5];
-                let ymin = (spatial_shape[1] as f64) * spatial_transform[3]
-                    + (spatial_shape[0] as f64) * spatial_transform[4]
-                    + spatial_transform[5];
-                [xmin, ymin, xmax, ymax]
-            };
-
-            let base_res = spatial_resolutions(&spatial_shape, &spatial_bbox);
-            let abs_scales = abs_scales(base_res, &multiscales, indices.as_slice());
-
-            let mut levels: Vec<ResolutionLevel> = multiscales
-                .layout
-                .iter()
-                .filter_map(|item| {
-                    abs_scales.get(&item.asset).map(|&scale| ResolutionLevel {
-                        scale,
-                        item: item.clone(),
-                    })
-                })
-                .collect();
-
-            // sort by scale ascending (finer resolution first)
-            levels.sort_by(|a, b| {
-                a.scale
-                    .partial_cmp(&b.scale)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
+        let resolution_levels = if let Some((levels, _)) = resolutions_and_shape {
             Some(levels)
         } else {
             None
         };
 
-        // get time coordinates
-        // TODO: extend to any non-spatial dimension
-        let mut temporal_indices = HashMap::new();
+        // get dimensional coordinates
+        let non_spatial_dims =
+            get_non_spatial_dims(spatial_dims.as_deref(), dimension_names.as_deref());
+        let mut dims_index = HashMap::new();
         if let Some(multiscales) = &multiscales {
             for layout_item in &multiscales.layout {
-                let base_path = format!("/{}", layout_item.asset);
-                let path = format!("/{}/time", layout_item.asset);
+                for dim in &non_spatial_dims {
+                    let path = format!("/{}/{dim}", layout_item.asset);
+                    let array = Array::async_open(Arc::clone(&zarr_store), path.as_str())
+                        .await
+                        .map_err(ZarrError::ArrayCreateError)?;
+                    let index = DimIndex::load(&array).await?;
+                    dims_index.insert(path, index);
+                }
+            }
+        } else {
+            for dim in &non_spatial_dims {
+                let path = format!("/{dim}");
                 let array = Array::async_open(Arc::clone(&zarr_store), path.as_str())
                     .await
                     .map_err(ZarrError::ArrayCreateError)?;
-                let temporal_index = TemporalIndex::load(&array).await?;
-                temporal_indices.insert(base_path, temporal_index);
+                let index = DimIndex::load(&array).await?;
+                dims_index.insert(path, index);
             }
-        } else {
-            let array = Array::async_open(Arc::clone(&zarr_store), "/time")
-                .await
-                .map_err(ZarrError::ArrayCreateError)?;
-            let temporal_index = TemporalIndex::load(&array).await?;
-            temporal_indices.insert("/".into(), temporal_index);
         }
 
-        let bounds = if let Some(spatial_bbox) = spatial_bbox {
-            let transformer =
-                proj::Proj::try_from((src_crs.clone().into_string().as_str(), "EPSG:4326"))
-                    .map_err(ZarrError::ProjCreateError)?;
-            let (x_min, y_min) = transformer
-                .convert((spatial_bbox[0], spatial_bbox[1]))
-                .map_err(ZarrError::ProjError)?;
-            let (x_max, y_max) = transformer
-                .convert((spatial_bbox[2], spatial_bbox[3]))
-                .map_err(ZarrError::ProjError)?;
-            let bounds = Bounds::new(x_min, y_min, x_max, y_max);
-            Some(bounds)
-        } else {
-            None
-        };
-
+        let bounds = bounds_from_bbox(spatial_bbox, &src_crs)?;
         let tilejson = if let Some(bounds) = bounds {
             tilejson! {
                 tiles: vec![],
@@ -283,8 +223,9 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
             min_zoom: MIN_ZOOM,
             max_zoom: MAX_ZOOM,
             src_crs: src_crs.into_string(),
-            temporal_indices: temporal_indices.into(),
+            dims_index: dims_index.into(),
             data_vars: data_vars.into(),
+            spatial_dims: spatial_dims.unwrap_or(vec!["y".to_owned(), "x".to_owned()]),
             spatial_transform,
             spatial_shape: base_spatial_shape,
             spatial_registration,
@@ -292,7 +233,6 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
             warp_cache,
             resolution_levels,
             nodes,
-            dims_indices: dims_indices.expect("should have dimensions"),
         })
     }
 
@@ -322,7 +262,7 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
         &self,
         warp_grid: Box<[i64]>,
         warp_grid_bbox: [u64; 4],
-        tile_data: ndarray::Array3<f32>,
+        tile_data: Array2<f32>,
         fill_value: ZarrFillValue,
         min: f32,
         max: f32,
@@ -344,7 +284,8 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
 
 #[derive(Debug, Default)]
 struct QueryParams {
-    date_time: Option<DateTime<Utc>>,
+    time: Option<DateTime<Utc>>,
+    other_dims: HashMap<String, f64>,
     data_var: Option<String>,
     min: Option<f32>,
     max: Option<f32>,
@@ -388,12 +329,12 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
         if let Some(url_query) = url_query {
             for (key, value) in url_query {
                 match key.as_str() {
-                    "date" => {
+                    "dim:time" => {
                         let date_time = DateTime::parse_from_rfc3339(value)
                             .map(|dt| dt.with_timezone(&Utc))
                             .map_err(ZarrError::ParseError)
                             .map_err(MartinCoreError::ZarrError)?;
-                        query_params.date_time = Some(date_time);
+                        query_params.time = Some(date_time);
                     }
                     "data_var" => {
                         query_params.data_var = Some(value.as_str().into());
@@ -406,15 +347,22 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                         let val_f32 = value.parse().map_err(ZarrError::ParseFloatError)?;
                         query_params.max = Some(val_f32);
                     }
-                    _ => info!("Query string not supported"),
+                    key => {
+                        let rest = key.strip_prefix("dim:");
+                        let val = value.parse().map_err(ZarrError::ParseFloatError)?;
+                        if let Some(rest) = rest {
+                            query_params.other_dims.insert(rest.to_owned(), val);
+                        } else {
+                            info!("query parameter not supported: {key}");
+                        }
+                    }
                 }
             }
         }
 
         if xyz.z >= self.min_zoom
             && xyz.z <= self.max_zoom
-            && let (Some(date_time), Some(data_var_key), Some(min), Some(max)) = (
-                query_params.date_time,
+            && let (Some(data_var_key), Some(min), Some(max)) = (
                 query_params.data_var.as_deref(),
                 query_params.min,
                 query_params.max,
@@ -429,9 +377,8 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
             )?;
 
             // path to resolution level
-            let level_path = matching_item
-                .map(|item| format!("/{}", item.asset.clone()))
-                .unwrap_or("/".into());
+            let level_path =
+                matching_item.map_or("/".into(), |item| format!("/{}", item.asset.clone()));
 
             let data_path = if let Some(layout_item) = matching_item {
                 // all asset paths are relative to the group containing the multiscales metadata
@@ -447,6 +394,43 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                     "Data variable {data_path} does not exist in Zarr store"
                 ))
             })?;
+
+            let mut dim_coords = HashMap::new();
+            let time_path = format!("{level_path}/time");
+            let time_index = self.dims_index.get(&time_path);
+            if let Some(index) = time_index
+                && let Some(date_time) = &query_params.time
+            {
+                let DimMeta::Time(meta) = &index.meta;
+                let val = meta.datetime_to_raw(date_time);
+                let coord = index.get_index(val);
+                dim_coords.insert("time".to_owned(), coord);
+            }
+
+            for (dim_name, val) in query_params.other_dims {
+                let dim_path = format!("{level_path}/{dim_name}");
+                if let Some((_, index)) =
+                    self.dims_index.iter().find(|(path, _)| **path == dim_path)
+                {
+                    let coord = index.get_index(val);
+                    dim_coords.insert(dim_name, coord);
+                }
+            }
+
+            let Some(dimension_names) = data_var.dimension_names() else {
+                return Err(MartinCoreError::ZarrError(ZarrError::DimensionError(
+                    "missing array dimensions".to_owned(),
+                )));
+            };
+
+            if dimension_names.len() != dim_coords.len() + 2 {
+                return Err(MartinCoreError::ZarrError(ZarrError::DimensionError(
+                    format!(
+                        "number of dimension parameters must be 2 less than array dimensions: {}",
+                        dimension_names.len()
+                    ),
+                )));
+            }
 
             let fill_value = fill_value(data_var.fill_value(), data_var.data_type())?;
 
@@ -465,7 +449,7 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                         .expect("array node should be in hierarchy");
                     get_spatial_shape(node).unwrap_or(None)
                 })
-                .or_else(|| self.spatial_shape)
+                .or(self.spatial_shape)
                 .expect("spatial:shape to be present in hierarchy");
 
             let warp_grid = self
@@ -488,16 +472,9 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                 return Ok(vec![]);
             };
 
-            let time_coords = self.temporal_indices.get(&level_path);
-
-            let tile_data = retrieve_tile_data(
-                warp_grid_bbox,
-                time_coords,
-                date_time,
-                data_var,
-                &self.dims_indices,
-            )
-            .await?;
+            let tile_data =
+                retrieve_tile_data(warp_grid_bbox, dim_coords, data_var, &self.spatial_dims)
+                    .await?;
 
             let sampled_data = self
                 .run_sample_data(warp_grid, warp_grid_bbox, tile_data, fill_value, min, max)
