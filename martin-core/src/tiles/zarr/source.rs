@@ -42,11 +42,11 @@ use crate::CacheZoomRange;
 use crate::tiles::zarr::cache::{WarpCache, WarpCacheKey};
 use crate::tiles::zarr::error::ZarrError;
 use crate::tiles::zarr::utils::{
-    DimIndex, DimMeta, Proj, ResolutionLevel, SpatialAxisIndices, TILE_PIXELS, WarpGrid,
-    ZarrFillValue, bounds_from_bbox, calculate_resolution_levels, calculate_warp_grid, fill_value,
-    get_bbox, get_multiscales, get_non_spatial_dims, get_proj, get_spatial_dims,
-    get_spatial_registration, get_spatial_shape, get_spatial_transform, is_data_variable,
-    retrieve_tile_data, sample_data, select_best_level, zarr_nodes,
+    DimIndex, DimMeta, Proj, ResolutionLevel, TILE_PIXELS, WarpGrid, ZarrFillValue,
+    bounds_from_bbox, calculate_resolution_levels, calculate_warp_grid, fill_value, get_bbox,
+    get_multiscales, get_non_spatial_dims, get_proj, get_spatial_dims, get_spatial_registration,
+    get_spatial_shape, get_spatial_transform, is_data_variable, retrieve_tile_data, sample_data,
+    select_best_level, zarr_nodes,
 };
 use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
 
@@ -377,8 +377,6 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
             )?;
 
             // path to resolution level
-            let level_path =
-                matching_item.map_or("/".into(), |item| format!("/{}", item.asset.clone()));
 
             let data_path = if let Some(layout_item) = matching_item {
                 // all asset paths are relative to the group containing the multiscales metadata
@@ -395,8 +393,12 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                 ))
             })?;
 
+            let mut asset_path =
+                matching_item.map_or(String::new(), |item| format!("/{}", item.asset.clone()));
+            asset_path.push('/');
+
             let mut dim_coords = HashMap::new();
-            let time_path = format!("{level_path}/time");
+            let time_path = format!("{asset_path}time");
             let time_index = self.dims_index.get(&time_path);
             if let Some(index) = time_index
                 && let Some(date_time) = &query_params.time
@@ -408,7 +410,7 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
             }
 
             for (dim_name, val) in query_params.other_dims {
-                let dim_path = format!("{level_path}/{dim_name}");
+                let dim_path = format!("{asset_path}{dim_name}");
                 if let Some((_, index)) =
                     self.dims_index.iter().find(|(path, _)| **path == dim_path)
                 {

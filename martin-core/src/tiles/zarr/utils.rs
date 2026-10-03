@@ -220,41 +220,6 @@ pub(crate) fn calculate_resolution_levels<T: ObjectStore>(
     }
 }
 
-/// Map spatial dimension names to their positions after single-element dimensions are squeezed
-#[derive(Debug, Clone)]
-pub(crate) struct SpatialAxisIndices {
-    pub(crate) y_axis: usize,
-    pub(crate) x_axis: usize,
-}
-
-impl SpatialAxisIndices {
-    /// Resolve axis positions from array dimension names and identified `GeoZarr` spatial names
-    pub(crate) fn resolve<T: AsRef<str>>(
-        dim_names: &[Option<String>],
-        spatial_dims: &[T],
-    ) -> Result<Self, ZarrError> {
-        let y_name = spatial_dims[0].as_ref();
-        let y_axis = dim_names
-            .iter()
-            .filter_map(|d| d.as_deref())
-            .position(|d| d == y_name)
-            .ok_or(ZarrError::DimensionError(
-                "Y dimension not found in array dimensions".to_owned(),
-            ))?;
-
-        let x_name = spatial_dims[1].as_ref();
-        let x_axis = dim_names
-            .iter()
-            .filter_map(|d| d.as_deref())
-            .position(|d| d == x_name)
-            .ok_or(ZarrError::DimensionError(
-                "X dimension not found in array dimensions".to_owned(),
-            ))?;
-
-        Ok(Self { y_axis, x_axis })
-    }
-}
-
 /// Check if the array is a data variable
 pub(crate) fn is_data_variable(node: &Node) -> Result<bool, ZarrError> {
     let metadata = node.metadata();
@@ -321,7 +286,7 @@ pub(crate) fn node_attributes(node: &Node) -> Map<String, Value> {
     }
 }
 
-/// Get coordinate system definition as EPSG code
+/// Get coordinate system definition
 ///
 /// At least one of proj:code, proj:wkt2, or proj:projjson MUST be provided.
 /// Inherited to direct child arrays of a group. Can be overriden at array level.
@@ -613,7 +578,7 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore, S: AsRef<str>>(
             "missing dimension names".to_owned(),
         ));
     };
-    let spatial_indices = SpatialAxisIndices::resolve(dimension_names, spatial_dims)?;
+    let spatial_indices = get_spatial_dims_indices(spatial_dims, dimension_names)?;
 
     let x_end = warp_grid_bbox[2]
         .checked_add(1)
@@ -657,13 +622,18 @@ pub(crate) async fn retrieve_tile_data<T: ObjectStore, S: AsRef<str>>(
     };
 
     let mut squeezed = full_subset;
-    for axis in (0..squeezed.ndim()).rev() {
-        if squeezed.shape()[axis] == 1 {
-            squeezed = squeezed.remove_axis(Axis(axis));
+    for (idx, _) in dimension_names.iter().enumerate() {
+        // remove non-spatial axis
+        if spatial_indices
+            .iter()
+            .find(|spatial| **spatial == idx)
+            .is_none()
+        {
+            squeezed = squeezed.remove_axis(Axis(idx));
         }
     }
 
-    let tile_data = if spatial_indices.y_axis < spatial_indices.x_axis {
+    let tile_data = if spatial_indices[0] < spatial_indices[1] {
         // already in [Y, X] orientation
         squeezed
             .into_dimensionality::<Ix2>()
