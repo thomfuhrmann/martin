@@ -34,7 +34,7 @@ pub enum ZarrError {
     AttributeError(String),
     /// Chrono parse error
     #[error("Chrono parsing error: {0}")]
-    ParseError(chrono::ParseError),
+    ChronoError(chrono::ParseError),
     /// Float parse error
     #[error("Float parsing error: {0}")]
     ParseFloatError(ParseFloatError),
@@ -68,6 +68,9 @@ pub enum ZarrError {
     /// Parameter error
     #[error("Parameter error: {0}")]
     ParameterError(String),
+    /// Json parsing error
+    #[error("Json error: {0}")]
+    JsonError(serde_json::Error),
     /// Fill value conversion error
     #[error("Fill value from slice error: {0}")]
     FillValueError(TryFromSliceError),

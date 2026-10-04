@@ -51,8 +51,8 @@ use crate::tiles::zarr::utils::{
     DimIndex, DimMeta, Proj, ResolutionLevel, TILE_PIXELS, WarpGrid, ZarrFillValue,
     bounds_from_bbox, calculate_resolution_levels, calculate_warp_grid, fill_value, get_bbox,
     get_multiscales, get_non_spatial_dims, get_proj, get_spatial_dims, get_spatial_registration,
-    get_spatial_shape, get_spatial_transform, is_data_variable, retrieve_tile_data, sample_data,
-    select_best_level, zarr_nodes,
+    get_spatial_shape, get_spatial_transform, is_data_variable, native_tile_res,
+    retrieve_tile_data, sample_data, select_best_level, zarr_nodes,
 };
 use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
 
@@ -290,7 +290,7 @@ impl<T: ObjectStore + Clone> ZarrSource<T> {
 
 #[derive(Debug, Default)]
 struct QueryParams {
-    time: Option<DateTime<Utc>>,
+    temporal_dims: HashMap<String, DateTime<Utc>>,
     other_dims: HashMap<String, f64>,
     data_var: Option<String>,
     min: Option<f32>,
@@ -335,13 +335,6 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
         if let Some(url_query) = url_query {
             for (key, value) in url_query {
                 match key.as_str() {
-                    "dim:time" => {
-                        let date_time = DateTime::parse_from_rfc3339(value)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .map_err(ZarrError::ParseError)
-                            .map_err(MartinCoreError::ZarrError)?;
-                        query_params.time = Some(date_time);
-                    }
                     "data_var" => {
                         query_params.data_var = Some(value.as_str().into());
                     }
@@ -355,9 +348,19 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
                     }
                     key => {
                         let rest = key.strip_prefix("dim:");
-                        let val = value.parse().map_err(ZarrError::ParseFloatError)?;
                         if let Some(rest) = rest {
-                            query_params.other_dims.insert(rest.to_owned(), val);
+                            if rest.contains("time") {
+                                let date_time = DateTime::parse_from_rfc3339(value)
+                                    .map(|dt| dt.with_timezone(&Utc))
+                                    .map_err(ZarrError::ChronoError)
+                                    .map_err(MartinCoreError::ZarrError)?;
+                                query_params
+                                    .temporal_dims
+                                    .insert(rest.to_owned(), date_time);
+                            } else {
+                                let val = value.parse().map_err(ZarrError::ParseFloatError)?;
+                                query_params.other_dims.insert(rest.to_owned(), val);
+                            }
                         } else {
                             info!("query parameter not supported: {key}");
                         }
@@ -375,12 +378,15 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
             )
         {
             // dynamically determine path to data array for multiscales zarr stores
+            let target_res = native_tile_res(xyz, "EPSG:3857", "EPSG:4326")?;
             let matching_item = select_best_level(
                 xyz,
                 self.resolution_levels.as_deref(),
                 TARGET_CRS,
                 &self.src_crs,
             )?;
+            tracing::info!("target res: {target_res:?}");
+            tracing::info!("resolutions: {:?}", self.resolution_levels);
 
             // path to resolution level
 
@@ -404,15 +410,16 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
             asset_path.push('/');
 
             let mut dim_coords = HashMap::new();
-            let time_path = format!("{asset_path}time");
-            let time_index = self.dims_index.get(&time_path);
-            if let Some(index) = time_index
-                && let Some(date_time) = &query_params.time
-            {
-                let DimMeta::Time(meta) = &index.meta;
-                let val = meta.datetime_to_raw(date_time);
-                let coord = index.get_index(val);
-                dim_coords.insert("time".to_owned(), coord);
+            for (dim_name, val) in query_params.temporal_dims {
+                let dim_path = format!("{asset_path}{dim_name}");
+                if let Some((_, index)) =
+                    self.dims_index.iter().find(|(path, _)| **path == dim_path)
+                {
+                    let DimMeta::Time(meta) = &index.meta;
+                    let val = meta.datetime_to_raw(&val);
+                    let coord = index.get_index(val);
+                    dim_coords.insert(dim_name, coord);
+                }
             }
 
             for (dim_name, val) in query_params.other_dims {

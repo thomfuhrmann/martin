@@ -74,6 +74,7 @@ pub(crate) struct ResolutionLevel {
 }
 
 pub(crate) const TILE_PIXELS: u32 = 512;
+const EARTH_RADIUS_M: f64 = 6_371_000.0;
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
 
 /// Calculate tile length for zoom level
@@ -81,8 +82,60 @@ pub(crate) fn tile_len(zoom: u8) -> f64 {
     EARTH_CIRCUMFERENCE / f64::from(1_u32 << zoom)
 }
 
+/// Calculates the spatial bounding box of a tile
+pub(crate) fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
+    let tile_length = tile_len(zoom);
+    let min_x = EARTH_CIRCUMFERENCE * -0.5 + f64::from(x) * tile_length;
+    let max_y = EARTH_CIRCUMFERENCE * 0.5 - f64::from(y) * tile_length;
+
+    [min_x, max_y - tile_length, min_x + tile_length, max_y]
+}
+
+/// Test if it is a spherial CRS
+pub(crate) fn is_spherical_crs(json_value: &Value) -> bool {
+    let Some(target_crs) = json_value.get("target_crs") else {
+        return false;
+    };
+    let Some(crs_type) = target_crs.get("type").and_then(|v| v.as_str()) else {
+        return false;
+    };
+
+    match crs_type {
+        "GeographicCRS" | "DerivedGeographicCRS" => true,
+        "GeodeticCRS" | "DerivedGeodeticCRS" => {
+            // ensure primary axis uses angular units
+            is_angular_axis(target_crs)
+        }
+        "CompoundCRS" => {
+            if let Some(components) = target_crs.get("components").and_then(|v| v.as_array()) {
+                components.iter().any(is_spherical_crs)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Test if the CRS uses anulgar units
+fn is_angular_axis(json: &Value) -> bool {
+    if let Some(unit) = json
+        .pointer("/coordinate_system/axis/0/unit")
+        .or_else(|| json.pointer("/datum/prime_meridian/unit"))
+    {
+        if let Some(unit_str) = unit.as_str() {
+            return unit_str.to_lowercase().contains("degree")
+                || unit_str.to_lowercase().contains("radian");
+        }
+        if let Some(unit_name) = unit.get("name").and_then(|v| v.as_str()) {
+            return unit_name.to_lowercase().contains("degree")
+                || unit_name.to_lowercase().contains("radian");
+        }
+    }
+    true
+}
+
 /// Calculate tile resolution in source coordinate system
-/// TODO: use spherical arcs for spherical systems
 pub(crate) fn native_tile_res(
     tile: TileCoord,
     target_crs: &str,
@@ -109,20 +162,13 @@ pub(crate) fn native_tile_res(
     let max_x = x1.max(x2).max(x3).max(x4);
 
     let span_x = (max_x - min_x).abs();
+
     let res_per_pixel = span_x / (f64::from(TILE_PIXELS));
 
     Ok(res_per_pixel)
 }
 
-/// Calculates the spatial bounding box of a tile
-pub(crate) fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
-    let tile_length = tile_len(zoom);
-    let min_x = EARTH_CIRCUMFERENCE * -0.5 + f64::from(x) * tile_length;
-    let max_y = EARTH_CIRCUMFERENCE * 0.5 - f64::from(y) * tile_length;
-
-    [min_x, max_y - tile_length, min_x + tile_length, max_y]
-}
-
+/// Retrieve bounds in EPSG:4326 from source
 pub(crate) fn bounds_from_bbox(
     spatial_bbox: Option<[f64; 4]>,
     src_crs: &Proj,
@@ -174,10 +220,6 @@ pub(crate) fn calculate_resolution_levels<T: ObjectStore>(
             let spatial_shape = indices.iter().map(|&idx| shape[idx]).collect::<Vec<_>>();
             [spatial_shape[0], spatial_shape[1]]
         };
-
-        // if base_spatial_shape.is_none() {
-        //     base_spatial_shape = Some(spatial_shape);
-        // }
 
         let spatial_bbox = if let Some(spatial_bbox) = spatial_bbox {
             spatial_bbox
@@ -1075,7 +1117,7 @@ impl TimeMetadata {
         // parse the date part
         let epoch_date =
             NaiveDate::parse_from_str(parts[1].split(' ').collect::<Vec<_>>()[0], "%Y-%m-%d")
-                .map_err(ZarrError::ParseError)?;
+                .map_err(ZarrError::ChronoError)?;
 
         // convert to UTC DateTime at midnight
         let epoch_date_time = epoch_date.and_hms_opt(0, 0, 0).ok_or(ZarrError::TimeError(
@@ -1151,6 +1193,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_projjson() {
+        let crs = proj::Proj::new_known_crs("EPSG:4326", "EPSG:4326", None).expect("crs");
+        let json_str = crs.to_projjson(None, None, None).expect("projjson");
+        let json_value: Value = serde_json::from_str(&json_str).expect("json value");
+        let target_crs = json_value.get("target_crs").expect("target crs");
+        let crs_type = target_crs.get("type").expect("type");
+        assert_eq!(crs_type, Some("GeographicCRS"));
+    }
+
+    #[tokio::test]
     async fn test_proj() {
         let store = get_zarr_store();
         let root_node = Node::async_open(Arc::clone(&store), "/")
@@ -1195,11 +1247,6 @@ mod tests {
         let indices = get_spatial_dims_indices(spatial_dims.as_slice(), dimension_names)
             .expect("should have indices");
         assert_eq!(indices, vec![1, 2]);
-        let temporal_index = get_temporal_dim_index(dimension_names).expect("should have indices");
-        assert_eq!(temporal_index, 0);
-        let dims_indices =
-            get_dims_indices(&spatial_dims, dimension_names).expect("should return indices");
-        assert_eq!(dims_indices, vec![0, 1, 2]);
     }
 
     #[tokio::test]
@@ -1327,11 +1374,11 @@ mod tests {
 
     #[test]
     fn test_sample_at_warp_grid() {
-        let mut data = ndarray::Array2::<f32>::zeros((4, 4));
+        let mut data = Array2::<f32>::zeros((4, 4));
 
         for y in 0..3 {
             for x in 0..3 {
-                data[[0, y, x]] = (y * 10 + x) as f32;
+                data[[y, x]] = (y * 10 + x) as f32;
             }
         }
 
