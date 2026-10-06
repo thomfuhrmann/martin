@@ -98,6 +98,9 @@ unstable-schemas = ["dep:schemars", "dep:utoipa"]
 zarr = [
     "dep:zarrs",
     "dep:zarrs_object_store",
+    "dep:zarrs_plugin",
+    "dep:zarr-cast-value",
+    "dep:inventory",
     "dep:proj",
     "dep:image",
     "dep:ndarray",
@@ -131,6 +134,7 @@ geo-types = { workspace = true, optional = true }
 geojson = { workspace = true, optional = true }
 hotpath.workspace = true
 image = { workspace = true, optional = true }
+inventory = { workspace = true, optional = true }
 itertools = { workspace = true, optional = true }
 martin-tile-utils.workspace = true
 mbtiles = { workspace = true, optional = true }
@@ -169,6 +173,8 @@ walkdir = { workspace = true, optional = true }
 xxhash-rust.workspace = true
 zarrs = { workspace = true, optional = true }
 zarrs_object_store = { workspace = true, optional = true }
+zarrs_plugin = { workspace = true, optional = true }
+zarr-cast-value = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]

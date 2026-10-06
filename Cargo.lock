@@ -5342,6 +5342,7 @@ dependencies = [
  "hotpath 0.23.2",
  "image",
  "insta",
+ "inventory",
  "itertools 0.15.0",
  "maplibre_native",
  "martin-tile-utils",
@@ -5384,8 +5385,10 @@ dependencies = [
  "walkdir",
  "wiremock",
  "xxhash-rust",
+ "zarr-cast-value",
  "zarrs",
  "zarrs_object_store",
+ "zarrs_plugin",
  "zstd",
 ]
 
@@ -10826,6 +10829,18 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
+]
+
+[[package]]
+name = "zarr-cast-value"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e395a177739bf518579a19cc12aa705bfa4d1c831f3a4cce13222b5ca0438248"
+dependencies = [
+ "num-traits",
+ "pulp",
+ "serde",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

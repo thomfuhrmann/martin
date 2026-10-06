@@ -41,4 +41,5 @@ observability:
 # https://atlantis-vis-o.s3-ext.jc.rl.ac.uk/noc-npd-era5-demo/npd-eorca025-era5v1/gn/T1y_4d/thetao_con/zarr.json
 zarr:
   sources:
+    eopf: https://s3.explorer.eopf.copernicus.eu/esa-zarr-sentinel-explorer-fra/tests-output/sentinel-2-l2a-staging/S2C_MSIL2A_20260913T135801_N0512_R010_T27WVU_20260913T171309.zarr/measurements/reflectance
     pyramid: tests/fixtures/zarr/pyramid.zarr

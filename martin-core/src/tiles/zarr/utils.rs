@@ -74,7 +74,6 @@ pub(crate) struct ResolutionLevel {
 }
 
 pub(crate) const TILE_PIXELS: u32 = 512;
-const EARTH_RADIUS_M: f64 = 6_371_000.0;
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
 
 /// Calculate tile length for zoom level
@@ -89,50 +88,6 @@ pub(crate) fn tile_bbox(x: u32, y: u32, zoom: u8) -> [f64; 4] {
     let max_y = EARTH_CIRCUMFERENCE * 0.5 - f64::from(y) * tile_length;
 
     [min_x, max_y - tile_length, min_x + tile_length, max_y]
-}
-
-/// Test if it is a spherial CRS
-pub(crate) fn is_spherical_crs(json_value: &Value) -> bool {
-    let Some(target_crs) = json_value.get("target_crs") else {
-        return false;
-    };
-    let Some(crs_type) = target_crs.get("type").and_then(|v| v.as_str()) else {
-        return false;
-    };
-
-    match crs_type {
-        "GeographicCRS" | "DerivedGeographicCRS" => true,
-        "GeodeticCRS" | "DerivedGeodeticCRS" => {
-            // ensure primary axis uses angular units
-            is_angular_axis(target_crs)
-        }
-        "CompoundCRS" => {
-            if let Some(components) = target_crs.get("components").and_then(|v| v.as_array()) {
-                components.iter().any(is_spherical_crs)
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
-/// Test if the CRS uses anulgar units
-fn is_angular_axis(json: &Value) -> bool {
-    if let Some(unit) = json
-        .pointer("/coordinate_system/axis/0/unit")
-        .or_else(|| json.pointer("/datum/prime_meridian/unit"))
-    {
-        if let Some(unit_str) = unit.as_str() {
-            return unit_str.to_lowercase().contains("degree")
-                || unit_str.to_lowercase().contains("radian");
-        }
-        if let Some(unit_name) = unit.get("name").and_then(|v| v.as_str()) {
-            return unit_name.to_lowercase().contains("degree")
-                || unit_name.to_lowercase().contains("radian");
-        }
-    }
-    true
 }
 
 /// Calculate tile resolution in source coordinate system
@@ -461,13 +416,29 @@ pub(crate) fn get_spatial_registration(node: &Node) -> Option<SpatialRegistratio
 ///
 /// Optional
 pub(crate) fn get_multiscales(node: &Node) -> Result<Option<Multiscales>, ZarrError> {
-    node_attributes(node)
+    let multiscales = node_attributes(node)
         .get("multiscales")
         .map(|val| {
-            serde_json::from_value(val.clone())
+            serde_json::from_value::<Multiscales>(val.clone())
                 .map_err(|e| ZarrError::AttributeError(e.to_string()))
         })
-        .transpose()
+        .transpose()?;
+    if multiscales.is_none() {
+        // if let Some(obj) = node_attributes(node)
+        //     .get("consolidated_metadata")
+        //     .and_then(|val| val.get("metadata"))
+        //     .and_then(|v| v.as_object())
+        // {
+        //     for (key, val) in obj {
+        //         let attrs = val.get("attributes");
+        //         println!("{key} => {val}");
+        //     }
+        // }
+
+        Ok(None)
+    } else {
+        Ok(multiscales)
+    }
 }
 
 /// Calculate the resolutions in x and y
@@ -1190,16 +1161,6 @@ mod tests {
                 NodePath::new("/1/air").expect("should be valid")
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn test_projjson() {
-        let crs = proj::Proj::new_known_crs("EPSG:4326", "EPSG:4326", None).expect("crs");
-        let json_str = crs.to_projjson(None, None, None).expect("projjson");
-        let json_value: Value = serde_json::from_str(&json_str).expect("json value");
-        let target_crs = json_value.get("target_crs").expect("target crs");
-        let crs_type = target_crs.get("type").expect("type");
-        assert_eq!(crs_type, Some("GeographicCRS"));
     }
 
     #[tokio::test]

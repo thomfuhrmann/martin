@@ -136,6 +136,7 @@ image-compare = "0.5"
 indicatif = "0.18.3"
 indoc = "2"
 insta = "1.46.3"
+inventory = "0.3.24"
 itertools = "0.15"
 json-patch = "4"
 lambda-web = { version = "0.2.1", features = ["actix4"] }
@@ -244,6 +245,8 @@ wiremock = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zarrs = { version = "0.23.13", features = ["async"] }
 zarrs_object_store = "0.7.0"
+zarrs_plugin = "0.4.1"
+zarr-cast-value = "0.4.2"
 zstd = "0.13"
 
 [profile.dev.package]

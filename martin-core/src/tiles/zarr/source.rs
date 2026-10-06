@@ -51,8 +51,8 @@ use crate::tiles::zarr::utils::{
     DimIndex, DimMeta, Proj, ResolutionLevel, TILE_PIXELS, WarpGrid, ZarrFillValue,
     bounds_from_bbox, calculate_resolution_levels, calculate_warp_grid, fill_value, get_bbox,
     get_multiscales, get_non_spatial_dims, get_proj, get_spatial_dims, get_spatial_registration,
-    get_spatial_shape, get_spatial_transform, is_data_variable, native_tile_res,
-    retrieve_tile_data, sample_data, select_best_level, zarr_nodes,
+    get_spatial_shape, get_spatial_transform, is_data_variable, retrieve_tile_data, sample_data,
+    select_best_level, zarr_nodes,
 };
 use crate::tiles::{MartinCoreError, MartinCoreResult, Source, UrlQuery};
 
@@ -378,18 +378,14 @@ impl<T: ObjectStore + Clone> Source for ZarrSource<T> {
             )
         {
             // dynamically determine path to data array for multiscales zarr stores
-            let target_res = native_tile_res(xyz, "EPSG:3857", "EPSG:4326")?;
             let matching_item = select_best_level(
                 xyz,
                 self.resolution_levels.as_deref(),
                 TARGET_CRS,
                 &self.src_crs,
             )?;
-            tracing::info!("target res: {target_res:?}");
-            tracing::info!("resolutions: {:?}", self.resolution_levels);
 
-            // path to resolution level
-
+            // resolve path to data variable
             let data_path = if let Some(layout_item) = matching_item {
                 // all asset paths are relative to the group containing the multiscales metadata
                 // current assumption is that multiscales is defined at the root group
